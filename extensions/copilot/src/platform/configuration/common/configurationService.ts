@@ -680,13 +680,9 @@ export namespace ConfigKey {
 		/** Maximum number of tool calls the execution subagent can make */
 		export const ExecutionSubagentToolCallLimit = defineSetting<number>('chat.executionSubagent.toolCallLimit', ConfigType.ExperimentBased, 10);
 
-		/** Use the prism trajectory-compaction model for conversation-history compaction (foreground and background calls). */
-		export const ConversationUsePrismCompaction = defineSetting<boolean>('chat.conversationCompaction.usePrismCompaction', ConfigType.ExperimentBased, false);
-		/** Model to use for conversation-history compaction. When usePrismCompaction is true, this overrides the default 'trajectory-compaction' model name. When false, an empty value preserves the main agent model. */
-		export const ConversationCompactionModel = defineSetting<string>('chat.conversationCompaction.model', ConfigType.ExperimentBased, '');
-
 		/** When enabled, the main agent's manage_todo_list tool is disabled and a background copilot-utility-small model maintains the todo list instead. */
 		export const BackgroundTodoAgentEnabled = defineSetting<boolean>('chat.agent.backgroundTodoAgent.enabled', ConfigType.ExperimentBased, false);
+
 
 		export const InlineEditsTriggerOnEditorChangeAfterSeconds = defineAndMigrateExpSetting<number | undefined>('chat.advanced.inlineEdits.triggerOnEditorChangeAfterSeconds', 'chat.inlineEdits.triggerOnEditorChangeAfterSeconds', 10);
 		export const InlineEditsNextCursorPredictionDisplayLine = defineAndMigrateExpSetting<boolean>('chat.advanced.inlineEdits.nextCursorPrediction.displayLine', 'chat.inlineEdits.nextCursorPrediction.displayLine', true);
@@ -948,6 +944,22 @@ export namespace ConfigKey {
 	export const selectedCompletionsModel = defineSetting<string>('selectedCompletionModel', ConfigType.Simple, '');
 
 	export const RateLimitAutoSwitchToAuto = defineSetting<boolean>('chat.rateLimitAutoSwitchToAuto', ConfigType.Simple, false, vBoolean());
+
+	/**
+	 * Route conversation-history compaction (both foreground `/compact` and background auto-compaction)
+	 * through the dedicated `trajectory-compaction` model resolved via the standard CAPI endpoint
+	 * provider, instead of the main agent model.
+	 *
+	 * Registered in package.json so users can opt out explicitly; an explicit user `false` wins over
+	 * the experiment.
+	 */
+	export const ConversationUsePrismCompaction = defineSetting<boolean>('chat.conversationCompaction.usePrismCompaction', ConfigType.ExperimentBased, false);
+	/**
+	 * Override model name used for conversation-history compaction. When `ConversationUsePrismCompaction`
+	 * is enabled, this overrides the default `trajectory-compaction` model name. When disabled, an empty
+	 * value preserves the main agent model.
+	 */
+	export const ConversationCompactionModel = defineSetting<string>('chat.conversationCompaction.model', ConfigType.ExperimentBased, '');
 
 	/** Use the Messages API instead of Chat Completions when supported */
 	export const UseAnthropicMessagesApi = defineSetting<boolean | undefined>('chat.anthropic.useMessagesApi', ConfigType.ExperimentBased, true);

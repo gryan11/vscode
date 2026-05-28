@@ -9,8 +9,8 @@ import { IChatEndpoint } from '../../../../../platform/networking/common/network
 import { DEFAULT_COMPACTION_MODEL, buildCompactionToolOpts, formatCompactionFailureError, resolveCompactionEndpoint } from '../compactionEndpoint';
 
 type ConfigValues = {
-	[ConfigKey.Advanced.ConversationCompactionModel.id]?: string;
-	[ConfigKey.Advanced.ConversationUsePrismCompaction.id]?: boolean;
+	[ConfigKey.ConversationCompactionModel.id]?: string;
+	[ConfigKey.ConversationUsePrismCompaction.id]?: boolean;
 };
 
 function setup(configValues: ConfigValues = {}) {
@@ -50,7 +50,7 @@ suite('resolveCompactionEndpoint', () => {
 
 	test('routes through endpointProvider (CAPI) with the default model when only usePrismCompaction is set', async () => {
 		const { configurationService, experimentationService, logService } = setup({
-			[ConfigKey.Advanced.ConversationUsePrismCompaction.id]: true,
+			[ConfigKey.ConversationUsePrismCompaction.id]: true,
 		});
 		const main = makeMainEndpoint();
 		const capiEndpoint = makeMainEndpoint('trajectory-compaction');
@@ -79,8 +79,8 @@ suite('resolveCompactionEndpoint', () => {
 
 	test('routes through endpointProvider with a custom model when both flags are set', async () => {
 		const { configurationService, experimentationService, logService } = setup({
-			[ConfigKey.Advanced.ConversationUsePrismCompaction.id]: true,
-			[ConfigKey.Advanced.ConversationCompactionModel.id]: 'trajectory-compaction-v2',
+			[ConfigKey.ConversationUsePrismCompaction.id]: true,
+			[ConfigKey.ConversationCompactionModel.id]: 'trajectory-compaction-v2',
 		});
 		const main = makeMainEndpoint();
 		const customEndpoint = makeMainEndpoint('trajectory-compaction-v2');
@@ -106,7 +106,7 @@ suite('resolveCompactionEndpoint', () => {
 
 	test('routes through endpointProvider when only model is set (proxy disabled)', async () => {
 		const { configurationService, experimentationService, logService } = setup({
-			[ConfigKey.Advanced.ConversationCompactionModel.id]: 'gpt-4o-mini',
+			[ConfigKey.ConversationCompactionModel.id]: 'gpt-4o-mini',
 		});
 		const main = makeMainEndpoint();
 		const customEndpoint = makeMainEndpoint('gpt-4o-mini');
@@ -133,7 +133,7 @@ suite('resolveCompactionEndpoint', () => {
 	test('falls back to main endpoint when endpointProvider.getChatEndpoint rejects', async () => {
 		const warnings: string[] = [];
 		const { configurationService, experimentationService } = setup({
-			[ConfigKey.Advanced.ConversationCompactionModel.id]: 'not-a-real-model',
+			[ConfigKey.ConversationCompactionModel.id]: 'not-a-real-model',
 		});
 		const main = makeMainEndpoint();
 		const endpointProvider = {
@@ -159,7 +159,7 @@ suite('resolveCompactionEndpoint', () => {
 	test('falls back to main endpoint when the prism-compaction-default model fails to resolve', async () => {
 		const warnings: string[] = [];
 		const { configurationService, experimentationService } = setup({
-			[ConfigKey.Advanced.ConversationUsePrismCompaction.id]: true,
+			[ConfigKey.ConversationUsePrismCompaction.id]: true,
 		});
 		const main = makeMainEndpoint();
 		const endpointProvider = {
