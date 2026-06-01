@@ -462,7 +462,7 @@ export function matchesPrismFilter(endpoint: IChatEndpoint, filter: string): boo
  * compaction endpoint (when relevant), and a human-readable reason suitable
  * for debug logging.
  */
-export interface IPrismRoutingDecision {
+interface IPrismRoutingDecision {
 	readonly usePrism: boolean;
 	readonly reason: string;
 	/** Resolved compaction endpoint when the prism flag is on and the filter matches; undefined otherwise. */
@@ -893,7 +893,7 @@ class ConversationHistorySummarizer {
 			(tool, rule) => {
 				this.logService.warn(`[ConversationHistorySummarizer] Tool ${tool} failed validation: ${rule}`);
 			},
-		) : undefined, associatedRequestId, stopwatch);
+		) : undefined, associatedRequestId, stopwatch, /* treatLengthAsSuccess */ true);
 	}
 
 	/**
@@ -958,7 +958,7 @@ class ConversationHistorySummarizer {
 	 * tool-search, Gemini orphaned-tool-call), issues the chat request, and
 	 * returns the `SummarizationResult`.
 	 */
-	private async _executeSummarizationRequest(endpoint: IChatEndpoint, mode: SummaryMode, summarizationPrompt: ChatMessage[], buildToolOpts: () => CompactionToolOpts | undefined, associatedRequestId: string | undefined, stopwatch: StopWatch): Promise<SummarizationResult> {
+	private async _executeSummarizationRequest(endpoint: IChatEndpoint, mode: SummaryMode, summarizationPrompt: ChatMessage[], buildToolOpts: () => CompactionToolOpts | undefined, associatedRequestId: string | undefined, stopwatch: StopWatch, treatLengthAsSuccess?: boolean): Promise<SummarizationResult> {
 		let summaryResponse: ChatResponse;
 		let promptTypes: string | undefined;
 		try {
@@ -1034,7 +1034,7 @@ class ConversationHistorySummarizer {
 
 		const durationMs = stopwatch.elapsed();
 		return {
-			result: await this.handleSummarizationResponse(summaryResponse, mode, durationMs, endpoint.model, promptTypes),
+			result: await this.handleSummarizationResponse(summaryResponse, mode, durationMs, endpoint.model, promptTypes, treatLengthAsSuccess),
 			promptTokenDetails,
 			model: endpoint.model,
 			summarizationMode: mode,
@@ -1042,7 +1042,21 @@ class ConversationHistorySummarizer {
 		};
 	}
 
-	private async handleSummarizationResponse(response: ChatResponse, mode: SummaryMode, elapsedTime: number, model: string, promptTypes?: string): Promise<FetchSuccess<string>> {
+	private async handleSummarizationResponse(response: ChatResponse, mode: SummaryMode, elapsedTime: number, model: string, promptTypes?: string, treatLengthAsSuccess?: boolean): Promise<FetchSuccess<string>> {
+		if (treatLengthAsSuccess && response.type === ChatFetchResponseType.Length) {
+			// Prism-only: model hit its output token cap. The partial text is still usable as
+			// a summary, so surface a warning and synthesise a FetchSuccess instead of failing.
+			// Off-flag callers don't pass treatLengthAsSuccess and continue to throw as before.
+			this.logService.warn(`[ConversationHistorySummarizer] [${mode}] prism summarization response truncated by model length limit (${response.truncatedValue.length} chars). Using partial summary.`);
+			response = {
+				type: ChatFetchResponseType.Success,
+				value: response.truncatedValue,
+				requestId: response.requestId,
+				serverRequestId: response.serverRequestId,
+				usage: undefined,
+				resolvedModel: model,
+			};
+		}
 		if (response.type !== ChatFetchResponseType.Success) {
 			const outcome = response.type;
 			this.sendSummarizationTelemetry(outcome, response.requestId, model, mode, elapsedTime, undefined, response.reason ?? response.type);
