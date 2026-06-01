@@ -4248,7 +4248,7 @@
           },
           "github.copilot.chat.conversationCompaction.prismModelFilter": {
             "type": "string",
-            "default": "claude-haiku-4.5,claude-sonnet-4.5,claude-sonnet-4.6,gemini-2.5-pro",
+            "default": "claude-haiku-4.5,claude-sonnet-4.5,claude-sonnet-4.6,gemini-2.5-pro,gemini-3-flash,gemini-3.5-flash",
             "markdownDescription": "%github.copilot.config.conversationCompaction.prismModelFilter%",
             "tags": [
               "experimental",
