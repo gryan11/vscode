@@ -38,7 +38,7 @@ import { IBuildPromptContext, IToolCallRound } from '../../../prompt/common/inte
 import { ToolName } from '../../../tools/common/toolNames';
 import { normalizeToolSchema } from '../../../tools/common/toolSchemaNormalizer';
 import { NotebookSummary } from '../../../tools/node/notebookSummaryTool';
-import { PromptRenderer } from '../base/promptRenderer';
+import { PromptRenderer, renderPromptElement } from '../base/promptRenderer';
 import { Tag } from '../base/tag';
 import { ChatToolCalls } from '../panel/toolCalling';
 import { AgentUserMessage, AgentUserMessageCustomizations, getUserMessagePropsFromAgentProps, getUserMessagePropsFromTurn } from './agentPrompt';
@@ -770,12 +770,12 @@ class ConversationHistorySummarizer {
 			this.endpointProvider,
 			this.logService,
 		);
-		this.logService.debug(
-			`[ConversationHistorySummarizer] [${mode}] foreground compaction routing: usePrism=${decision.usePrism} — ${decision.reason}`
-		);
 		if (!decision.usePrism) {
 			return this._getSummary(mode, propsInfo);
 		}
+		this.logService.debug(
+			`[ConversationHistorySummarizer] [${mode}] foreground compaction routing: usePrism=true — ${decision.reason}`
+		);
 		try {
 			return await this._getSummaryPrism(mode, propsInfo, decision.compactionEndpoint!);
 		} catch (e) {
@@ -833,7 +833,7 @@ class ConversationHistorySummarizer {
 			: this.props.endpoint;
 
 		const associatedRequestId = this.props.promptContext.conversation?.getLatestTurn().id;
-		const { messages: summarizationPrompt } = await this._renderSummarizationPrompt(endpoint, mode, propsInfo, stopwatch);
+		const summarizationPrompt = await this._renderSummarizationPrompt(endpoint, mode, propsInfo, stopwatch);
 
 		return this._executeSummarizationRequest(endpoint, mode, summarizationPrompt, () => {
 			const normalizedTools = mode === SummaryMode.Full ? normalizeToolSchema(
@@ -877,7 +877,7 @@ class ConversationHistorySummarizer {
 			: compactionEndpoint;
 
 		const associatedRequestId = this.props.promptContext.conversation?.getLatestTurn().id;
-		const { messages: summarizationPrompt, tokenCount: renderedTokens, removedCount } = await this._renderSummarizationPrompt(endpoint, mode, propsInfo, stopwatch);
+		const { messages: summarizationPrompt, tokenCount: renderedTokens, removedCount } = await this._renderSummarizationPromptWithTracer(endpoint, mode, propsInfo, stopwatch);
 
 		// Post-render check: prompt-tsx dropped nodes to fit the compaction
 		// endpoint's budget. The summary would be built from a truncated view of
@@ -899,13 +899,29 @@ class ConversationHistorySummarizer {
 	/**
 	 * Render the conversation-history summarization prompt against `endpoint`.
 	 * Emits the `renderError` / `budget_exceeded` telemetry and re-throws on
-	 * failure so the caller (off-flag / prism) can bail out uniformly.
-	 *
-	 * `removedCount` is captured via a prompt-tsx tracer and reflects how many
-	 * nodes prompt-tsx had to drop to fit the endpoint's token budget. The prism
-	 * path uses this as a precise (non-heuristic) pruning signal.
+	 * failure so the caller can bail out uniformly.
 	 */
-	private async _renderSummarizationPrompt(endpoint: IChatEndpoint, mode: SummaryMode, propsInfo: ISummarizedConversationHistoryInfo, stopwatch: StopWatch): Promise<{ messages: ChatMessage[]; tokenCount: number; removedCount: number }> {
+	private async _renderSummarizationPrompt(endpoint: IChatEndpoint, mode: SummaryMode, propsInfo: ISummarizedConversationHistoryInfo, stopwatch: StopWatch): Promise<ChatMessage[]> {
+		try {
+			const summarizationPrompt = (await renderPromptElement(this.instantiationService, endpoint, ConversationHistorySummarizationPrompt, { ...propsInfo.props, enableCacheBreakpoints: false, simpleMode: mode === SummaryMode.Simple }, undefined, this.token)).messages;
+			this.logInfo(`summarization prompt rendered in ${stopwatch.elapsed()}ms.`, mode);
+			return summarizationPrompt;
+		} catch (e) {
+			const budgetExceeded = e instanceof BudgetExceededError;
+			const outcome = budgetExceeded ? 'budget_exceeded' : 'renderError';
+			this.logInfo(`Error rendering summarization prompt in mode: ${mode}. ${e.stack}`, mode);
+			this.sendSummarizationTelemetry(outcome, '', endpoint.model, mode, stopwatch.elapsed(), undefined, e instanceof Error ? e.message : String(e));
+			throw e;
+		}
+	}
+
+	/**
+	 * Prism-only render variant that additionally captures a precise pruning
+	 * signal via a prompt-tsx tracer. Used by `_getSummaryPrism` to detect when
+	 * the compaction endpoint's smaller prompt budget caused nodes to be dropped
+	 * (in which case the caller falls back to the agent endpoint).
+	 */
+	private async _renderSummarizationPromptWithTracer(endpoint: IChatEndpoint, mode: SummaryMode, propsInfo: ISummarizedConversationHistoryInfo, stopwatch: StopWatch): Promise<{ messages: ChatMessage[]; tokenCount: number; removedCount: number }> {
 		try {
 			const renderer = PromptRenderer.create(
 				this.instantiationService,
@@ -916,9 +932,7 @@ class ConversationHistorySummarizer {
 			// Only attach the pruning-detection tracer when no other tracer is
 			// already in place — the dev `EnablePromptRendererTracing` config sets
 			// an `HTMLTracer` that the request logger downcasts to `HTMLTracer`,
-			// and replacing/chaining it would break that contract. Devs running
-			// with that flag forgo the pruning-driven fallback (acceptable since
-			// the flag is opt-in for prompt inspection, not production use).
+			// and replacing/chaining it would break that contract.
 			let removedCount = 0;
 			if (!renderer.tracer) {
 				renderer.tracer = {
@@ -1029,24 +1043,7 @@ class ConversationHistorySummarizer {
 	}
 
 	private async handleSummarizationResponse(response: ChatResponse, mode: SummaryMode, elapsedTime: number, model: string, promptTypes?: string): Promise<FetchSuccess<string>> {
-		let processed: FetchSuccess<string>;
-		if (response.type === ChatFetchResponseType.Success) {
-			processed = response;
-		} else if (response.type === ChatFetchResponseType.Length) {
-			// Model hit its output token cap mid-completion. The partial text is still
-			// usable as a summary — surface as a warning, normalize into a synthetic
-			// FetchSuccess and continue with the same budget checks as the success path
-			// instead of throwing.
-			this.logService.warn(`[ConversationHistorySummarizer] [${mode}] Summarization response truncated by model length limit (${response.truncatedValue.length} chars). Using partial summary.`);
-			processed = {
-				type: ChatFetchResponseType.Success,
-				value: response.truncatedValue,
-				requestId: response.requestId,
-				serverRequestId: response.serverRequestId,
-				usage: undefined,
-				resolvedModel: model,
-			};
-		} else {
+		if (response.type !== ChatFetchResponseType.Success) {
 			const outcome = response.type;
 			this.sendSummarizationTelemetry(outcome, response.requestId, model, mode, elapsedTime, undefined, response.reason ?? response.type);
 			this.logInfo(`Summarization request failed. ${response.type} ${response.reason ?? response.type}`, mode);
@@ -1057,21 +1054,20 @@ class ConversationHistorySummarizer {
 			throw new Error('Summarization request failed');
 		}
 
-		const summarySize = await this.sizing.countTokens(processed.value);
+		const summarySize = await this.sizing.countTokens(response.value);
 		const effectiveBudget =
 			!!this.props.maxSummaryTokens
 				? Math.min(this.sizing.tokenBudget, this.props.maxSummaryTokens)
 				: this.sizing.tokenBudget;
 		if (summarySize > effectiveBudget) {
-			this.sendSummarizationTelemetry('too_large', processed.requestId, model, mode, elapsedTime, processed.usage, `${summarySize} tokens exceeds budget ${effectiveBudget}`);
+			this.sendSummarizationTelemetry('too_large', response.requestId, model, mode, elapsedTime, response.usage, `${summarySize} tokens exceeds budget ${effectiveBudget}`);
 			this.logInfo(`Summary too large: ${summarySize} tokens (effective budget ${effectiveBudget})`, mode);
 			throw new Error('Summary too large');
 		}
 
-		const outcomeLabel = response.type === ChatFetchResponseType.Length ? 'truncated' : 'success';
-		this.sendSummarizationTelemetry(outcomeLabel, processed.requestId, model, mode, elapsedTime, processed.usage, undefined, promptTypes);
-		this.logInfo(`Summarization usage: prompt=${processed.usage?.prompt_tokens ?? '?'}, cached=${processed.usage?.prompt_tokens_details?.cached_tokens ?? '?'}, completion=${processed.usage?.completion_tokens ?? '?'}`, mode);
-		return processed;
+		this.sendSummarizationTelemetry('success', response.requestId, model, mode, elapsedTime, response.usage, undefined, promptTypes);
+		this.logInfo(`Summarization usage: prompt=${response.usage?.prompt_tokens ?? '?'}, cached=${response.usage?.prompt_tokens_details?.cached_tokens ?? '?'}, completion=${response.usage?.completion_tokens ?? '?'}`, mode);
+		return response;
 	}
 
 	/**
