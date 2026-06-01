@@ -85,6 +85,14 @@ export interface AgentPromptProps extends GenericBasePromptElementProps {
 	 * An explicit summarization mode configuration can still force Full mode.
 	 */
 	readonly forceSimpleSummary?: boolean;
+
+	/**
+	 * Size (in tokens) of the most recent successful agent render. Forwarded to
+	 * `SummarizedConversationHistory` so the prism compaction dispatcher can
+	 * detect when the conversation is already known to exceed the compaction
+	 * endpoint's prompt budget and route directly to the agent endpoint.
+	 */
+	readonly currentContextTokens?: number;
 }
 
 /** Proportion of the prompt token budget any singular textual tool result is allowed to use. */
@@ -157,6 +165,7 @@ export class AgentPrompt extends PromptElement<AgentPromptProps> {
 					flexGrow={1}
 					triggerSummarize={this.props.triggerSummarize}
 					forceSimpleSummary={this.props.forceSimpleSummary}
+					currentContextTokens={this.props.currentContextTokens}
 					priority={900}
 					promptContext={this.props.promptContext}
 					location={this.props.location}

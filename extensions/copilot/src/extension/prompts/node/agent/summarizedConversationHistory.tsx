@@ -38,7 +38,7 @@ import { IBuildPromptContext, IToolCallRound } from '../../../prompt/common/inte
 import { ToolName } from '../../../tools/common/toolNames';
 import { normalizeToolSchema } from '../../../tools/common/toolSchemaNormalizer';
 import { NotebookSummary } from '../../../tools/node/notebookSummaryTool';
-import { renderPromptElement } from '../base/promptRenderer';
+import { PromptRenderer } from '../base/promptRenderer';
 import { Tag } from '../base/tag';
 import { ChatToolCalls } from '../panel/toolCalling';
 import { AgentUserMessage, AgentUserMessageCustomizations, getUserMessagePropsFromAgentProps, getUserMessagePropsFromTurn } from './agentPrompt';
@@ -416,6 +416,31 @@ export interface SummarizedAgentHistoryProps extends BasePromptElementProps, Age
 	 * drifted from its frozen snapshot. See {@link AgentUserMessageProps.customizationsIndexUpdate}.
 	 */
 	readonly customizationsIndexUpdate?: { value: string; toolReferences: readonly ChatLanguageModelToolReference[] | undefined };
+	/**
+	 * Size (in tokens) of the most recent successful agent render. Used by the
+	 * prism compaction dispatcher to skip the prism path when the conversation
+	 * is already known to exceed the compaction endpoint's prompt budget.
+	 * Optional — callers that don't have a recent render size omit it.
+	 */
+	readonly currentContextTokens?: number;
+}
+
+/**
+ * Thrown by the prism foreground compaction path when the conversation can't
+ * fit the compaction endpoint without losing content. Detected either before
+ * rendering (when `currentContextTokens` is already larger than the compaction
+ * endpoint's budget) or after rendering (when prompt-tsx pruned one or more
+ * nodes to fit). Caught by the `getSummary` dispatcher to fall back to the
+ * agent endpoint, which typically has a larger context window.
+ */
+class PruningOccurredError extends Error {
+	constructor(
+		readonly removedCount: number,
+		readonly tokenCount: number,
+		readonly detectionPoint: 'pre-check' | 'post-render',
+	) {
+		super(`Prism compaction would lose content (${detectionPoint}: removedCount=${removedCount}, tokenCount=${tokenCount})`);
+	}
 }
 
 /**
@@ -667,9 +692,43 @@ class ConversationHistorySummarizer {
 		// The on-path resolves a separate compaction endpoint via the standard CAPI
 		// endpoint provider.
 		const usePrismCompaction = this.configurationService.getExperimentBasedConfig(ConfigKey.ConversationUsePrismCompaction, this.experimentationService);
-		return usePrismCompaction
-			? this._getSummaryPrism(mode, propsInfo)
-			: this._getSummary(mode, propsInfo);
+		if (!usePrismCompaction) {
+			return this._getSummary(mode, propsInfo);
+		}
+		try {
+			return await this._getSummaryPrism(mode, propsInfo);
+		} catch (e) {
+			if (isCancellationError(e)) {
+				throw e;
+			}
+			if (e instanceof PruningOccurredError) {
+				this.logService.warn(
+					`[ConversationHistorySummarizer] [${mode}] prism compaction endpoint cannot fit conversation without pruning ` +
+					`(${e.detectionPoint}: tokenCount=${e.tokenCount}, removedCount=${e.removedCount}). ` +
+					`Falling back to agent endpoint (model=${this.props.endpoint.model}, modelMaxPromptTokens=${this.props.endpoint.modelMaxPromptTokens}).`
+				);
+				return this._getSummary(mode, propsInfo);
+			}
+			if (this._isPromptTooLongError(e)) {
+				this.logService.warn(`[ConversationHistorySummarizer] [${mode}] prism compaction endpoint could not fit prompt (${e instanceof Error ? e.message : String(e)}). Falling back to agent endpoint (model=${this.props.endpoint.model}, modelMaxPromptTokens=${this.props.endpoint.modelMaxPromptTokens}).`);
+				return this._getSummary(mode, propsInfo);
+			}
+			throw e;
+		}
+	}
+
+	/**
+	 * Detect render-time `BudgetExceededError` (prompt-tsx couldn't fit the prompt
+	 * into the endpoint's token budget) or a server-side `context_length_exceeded`
+	 * surfaced as a thrown Error. Both are prompt-too-long signals that warrant
+	 * falling back to the main agent endpoint (typically a larger context window).
+	 */
+	private _isPromptTooLongError(e: unknown): boolean {
+		if (e instanceof BudgetExceededError) {
+			return true;
+		}
+		const message = e instanceof Error ? e.message : String(e);
+		return /context[_ ]length[_ ]exceeded|prompt.*too long|maximum context length/i.test(message);
 	}
 
 	/**
@@ -693,7 +752,7 @@ class ConversationHistorySummarizer {
 			: this.props.endpoint;
 
 		const associatedRequestId = this.props.promptContext.conversation?.getLatestTurn().id;
-		const summarizationPrompt = await this._renderSummarizationPrompt(endpoint, mode, propsInfo, stopwatch);
+		const { messages: summarizationPrompt } = await this._renderSummarizationPrompt(endpoint, mode, propsInfo, stopwatch);
 
 		return this._executeSummarizationRequest(endpoint, mode, summarizationPrompt, () => {
 			const normalizedTools = mode === SummaryMode.Full ? normalizeToolSchema(
@@ -735,6 +794,18 @@ class ConversationHistorySummarizer {
 			this.logService,
 		);
 
+		// Pre-check: if the last successful agent render was already larger than
+		// the compaction endpoint's prompt budget, the current conversation (at
+		// least that big) cannot fit the compaction endpoint without losing
+		// content. Skip the wasted prism render and go straight to the agent
+		// endpoint via the dispatcher's catch.
+		const lastContextSize = this.props.currentContextTokens;
+		if (lastContextSize !== undefined
+			&& lastContextSize > compactionEndpoint.modelMaxPromptTokens
+			&& this.props.endpoint.modelMaxPromptTokens > compactionEndpoint.modelMaxPromptTokens) {
+			throw new PruningOccurredError(0, lastContextSize, 'pre-check');
+		}
+
 		const tools = this.props.tools;
 		const toolTokens = mode === SummaryMode.Full && tools?.length
 			? await compactionEndpoint.acquireTokenizer().countToolTokens(tools)
@@ -745,7 +816,15 @@ class ConversationHistorySummarizer {
 			: compactionEndpoint;
 
 		const associatedRequestId = this.props.promptContext.conversation?.getLatestTurn().id;
-		const summarizationPrompt = await this._renderSummarizationPrompt(endpoint, mode, propsInfo, stopwatch);
+		const { messages: summarizationPrompt, tokenCount: renderedTokens, removedCount } = await this._renderSummarizationPrompt(endpoint, mode, propsInfo, stopwatch);
+
+		// Post-render check: prompt-tsx dropped nodes to fit the compaction
+		// endpoint's budget. The summary would be built from a truncated view of
+		// the conversation. Fall back to the agent endpoint when it has more
+		// headroom so the summary sees the full conversation instead.
+		if (removedCount > 0 && this.props.endpoint.modelMaxPromptTokens > compactionEndpoint.modelMaxPromptTokens) {
+			throw new PruningOccurredError(removedCount, renderedTokens, 'post-render');
+		}
 
 		return this._executeSummarizationRequest(endpoint, mode, summarizationPrompt, () => mode === SummaryMode.Full ? buildCompactionToolOpts(
 			this.props.tools,
@@ -760,12 +839,34 @@ class ConversationHistorySummarizer {
 	 * Render the conversation-history summarization prompt against `endpoint`.
 	 * Emits the `renderError` / `budget_exceeded` telemetry and re-throws on
 	 * failure so the caller (off-flag / prism) can bail out uniformly.
+	 *
+	 * `removedCount` is captured via a prompt-tsx tracer and reflects how many
+	 * nodes prompt-tsx had to drop to fit the endpoint's token budget. The prism
+	 * path uses this as a precise (non-heuristic) pruning signal.
 	 */
-	private async _renderSummarizationPrompt(endpoint: IChatEndpoint, mode: SummaryMode, propsInfo: ISummarizedConversationHistoryInfo, stopwatch: StopWatch): Promise<ChatMessage[]> {
+	private async _renderSummarizationPrompt(endpoint: IChatEndpoint, mode: SummaryMode, propsInfo: ISummarizedConversationHistoryInfo, stopwatch: StopWatch): Promise<{ messages: ChatMessage[]; tokenCount: number; removedCount: number }> {
 		try {
-			const summarizationPrompt = (await renderPromptElement(this.instantiationService, endpoint, ConversationHistorySummarizationPrompt, { ...propsInfo.props, enableCacheBreakpoints: false, simpleMode: mode === SummaryMode.Simple }, undefined, this.token)).messages;
-			this.logInfo(`summarization prompt rendered in ${stopwatch.elapsed()}ms.`, mode);
-			return summarizationPrompt;
+			const renderer = PromptRenderer.create(
+				this.instantiationService,
+				endpoint,
+				ConversationHistorySummarizationPrompt,
+				{ ...propsInfo.props, enableCacheBreakpoints: false, simpleMode: mode === SummaryMode.Simple },
+			);
+			// Only attach the pruning-detection tracer when no other tracer is
+			// already in place — the dev `EnablePromptRendererTracing` config sets
+			// an `HTMLTracer` that the request logger downcasts to `HTMLTracer`,
+			// and replacing/chaining it would break that contract. Devs running
+			// with that flag forgo the pruning-driven fallback (acceptable since
+			// the flag is opt-in for prompt inspection, not production use).
+			let removedCount = 0;
+			if (!renderer.tracer) {
+				renderer.tracer = {
+					didMaterializeTree: data => { removedCount = data.renderedTree.removed; },
+				};
+			}
+			const rendered = await renderer.render(undefined, this.token);
+			this.logInfo(`summarization prompt rendered in ${stopwatch.elapsed()}ms (${rendered.tokenCount} tokens, ${removedCount} pruned).`, mode);
+			return { messages: rendered.messages, tokenCount: rendered.tokenCount, removedCount };
 		} catch (e) {
 			const budgetExceeded = e instanceof BudgetExceededError;
 			const outcome = budgetExceeded ? 'budget_exceeded' : 'renderError';
@@ -867,7 +968,24 @@ class ConversationHistorySummarizer {
 	}
 
 	private async handleSummarizationResponse(response: ChatResponse, mode: SummaryMode, elapsedTime: number, model: string, promptTypes?: string): Promise<FetchSuccess<string>> {
-		if (response.type !== ChatFetchResponseType.Success) {
+		let processed: FetchSuccess<string>;
+		if (response.type === ChatFetchResponseType.Success) {
+			processed = response;
+		} else if (response.type === ChatFetchResponseType.Length) {
+			// Model hit its output token cap mid-completion. The partial text is still
+			// usable as a summary — surface as a warning, normalize into a synthetic
+			// FetchSuccess and continue with the same budget checks as the success path
+			// instead of throwing.
+			this.logService.warn(`[ConversationHistorySummarizer] [${mode}] Summarization response truncated by model length limit (${response.truncatedValue.length} chars). Using partial summary.`);
+			processed = {
+				type: ChatFetchResponseType.Success,
+				value: response.truncatedValue,
+				requestId: response.requestId,
+				serverRequestId: response.serverRequestId,
+				usage: undefined,
+				resolvedModel: model,
+			};
+		} else {
 			const outcome = response.type;
 			this.sendSummarizationTelemetry(outcome, response.requestId, model, mode, elapsedTime, undefined, response.reason ?? response.type);
 			this.logInfo(`Summarization request failed. ${response.type} ${response.reason ?? response.type}`, mode);
@@ -878,20 +996,21 @@ class ConversationHistorySummarizer {
 			throw new Error('Summarization request failed');
 		}
 
-		const summarySize = await this.sizing.countTokens(response.value);
+		const summarySize = await this.sizing.countTokens(processed.value);
 		const effectiveBudget =
 			!!this.props.maxSummaryTokens
 				? Math.min(this.sizing.tokenBudget, this.props.maxSummaryTokens)
 				: this.sizing.tokenBudget;
 		if (summarySize > effectiveBudget) {
-			this.sendSummarizationTelemetry('too_large', response.requestId, model, mode, elapsedTime, response.usage, `${summarySize} tokens exceeds budget ${effectiveBudget}`);
+			this.sendSummarizationTelemetry('too_large', processed.requestId, model, mode, elapsedTime, processed.usage, `${summarySize} tokens exceeds budget ${effectiveBudget}`);
 			this.logInfo(`Summary too large: ${summarySize} tokens (effective budget ${effectiveBudget})`, mode);
 			throw new Error('Summary too large');
 		}
 
-		this.sendSummarizationTelemetry('success', response.requestId, model, mode, elapsedTime, response.usage, undefined, promptTypes);
-		this.logInfo(`Summarization usage: prompt=${response.usage?.prompt_tokens ?? '?'}, cached=${response.usage?.prompt_tokens_details?.cached_tokens ?? '?'}, completion=${response.usage?.completion_tokens ?? '?'}`, mode);
-		return response;
+		const outcomeLabel = response.type === ChatFetchResponseType.Length ? 'truncated' : 'success';
+		this.sendSummarizationTelemetry(outcomeLabel, processed.requestId, model, mode, elapsedTime, processed.usage, undefined, promptTypes);
+		this.logInfo(`Summarization usage: prompt=${processed.usage?.prompt_tokens ?? '?'}, cached=${processed.usage?.prompt_tokens_details?.cached_tokens ?? '?'}, completion=${processed.usage?.completion_tokens ?? '?'}`, mode);
+		return processed;
 	}
 
 	/**

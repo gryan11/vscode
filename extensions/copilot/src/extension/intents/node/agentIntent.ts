@@ -20,7 +20,7 @@ import { ILogService } from '../../../platform/log/common/logService';
 import { IEditLogService } from '../../../platform/multiFileEdit/common/editLogService';
 import { CUSTOM_TOOL_SEARCH_NAME, isAnthropicContextEditingEnabled } from '../../../platform/networking/common/anthropic';
 import { IChatEndpoint } from '../../../platform/networking/common/networking';
-import { modelsWithoutResponsesContextManagement } from '../../../platform/networking/common/openai';
+import { APIUsage, modelsWithoutResponsesContextManagement } from '../../../platform/networking/common/openai';
 import { INotebookService } from '../../../platform/notebook/common/notebookService';
 import { GenAiMetrics } from '../../../platform/otel/common/genAiMetrics';
 import { IOTelService } from '../../../platform/otel/common/otelService';
@@ -589,6 +589,7 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 			location: this.location,
 			enableSummarization: summarizationEnabled,
 			enableCacheBreakpoints: summarizationEnabled && !isMessagesApi,
+			currentContextTokens: this._lastRenderTokenCount > 0 ? this._lastRenderTokenCount : undefined,
 			...this.extraPromptProps,
 			customizations: this._resolvedCustomizations
 		};
@@ -1044,10 +1045,21 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 					enableRetryOnFilter: true,
 					interactionTypeOverride: 'conversation-compaction',
 				}, bgToken);
-				if (response.type !== ChatFetchResponseType.Success) {
+				let rawResponseText: string;
+				let responseUsage: APIUsage | undefined;
+				if (response.type === ChatFetchResponseType.Success) {
+					rawResponseText = response.value;
+					responseUsage = response.usage;
+				} else if (response.type === ChatFetchResponseType.Length) {
+					// `Length` means the model hit its output token cap mid-completion; the
+					// partial text is in `truncatedValue` and `extractSummary` already handles
+					// a missing `</summary>` close tag, so prefer using it over failing outright.
+					rawResponseText = response.truncatedValue;
+					this.logService.warn(`[ConversationHistorySummarizer] background compaction response truncated by model length limit (${rawResponseText.length} chars)`);
+				} else {
 					throw new Error(`Background summarization request failed: ${response.type}`);
 				}
-				const rawSummaryText = extractSummary(response.value);
+				const rawSummaryText = extractSummary(rawResponseText);
 				if (rawSummaryText === undefined) {
 					throw new Error('Background summarization: no <summary> tags found in response');
 				}
@@ -1109,17 +1121,17 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 					curTurnRoundIndex: numRoundsInCurrentTurn,
 					isDuringToolCalling: numRoundsInCurrentTurn > 0 ? 1 : 0,
 					duration: Date.now() - bgStartTime,
-					promptTokenCount: response.usage?.prompt_tokens,
-					promptCacheTokenCount: response.usage?.prompt_tokens_details?.cached_tokens,
-					responseTokenCount: response.usage?.completion_tokens,
+					promptTokenCount: responseUsage?.prompt_tokens,
+					promptCacheTokenCount: responseUsage?.prompt_tokens_details?.cached_tokens,
+					responseTokenCount: responseUsage?.completion_tokens,
 				});
 
 				return {
 					summary: summaryText,
 					toolCallRoundId,
-					promptTokens: response.usage?.prompt_tokens,
-					promptCacheTokens: response.usage?.prompt_tokens_details?.cached_tokens,
-					outputTokens: response.usage?.completion_tokens,
+					promptTokens: responseUsage?.prompt_tokens,
+					promptCacheTokens: responseUsage?.prompt_tokens_details?.cached_tokens,
+					outputTokens: responseUsage?.completion_tokens,
 					durationMs: Date.now() - bgStartTime,
 					model: this.endpoint.model,
 					summarizationMode: 'full',
@@ -1127,6 +1139,15 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 					numRoundsSinceLastSummarization,
 				};
 			} catch (err) {
+				// Token-driven cancellation (turn end, /compact, session dispose, endpoint switch)
+				// is expected — the outer BackgroundSummarizer.start discards the result. Don't
+				// log as error or telemeter as a failure; rethrow so the outer state machine still
+				// transitions consistently.
+				if (bgToken.isCancellationRequested || isCancellationError(err)) {
+					this.logService.debug(`[ConversationHistorySummarizer] background compaction cancelled`);
+					throw err;
+				}
+
 				this.logService.error(err, `[ConversationHistorySummarizer] background compaction failed`);
 
 				/* __GDPR__
@@ -1226,10 +1247,20 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 					enableRetryOnFilter: true,
 					interactionTypeOverride: 'conversation-compaction',
 				}, bgToken);
-				if (response.type !== ChatFetchResponseType.Success) {
+				let rawResponseText: string;
+				let responseUsage: APIUsage | undefined;
+				if (response.type === ChatFetchResponseType.Success) {
+					rawResponseText = response.value;
+					responseUsage = response.usage;
+				} else if (response.type === ChatFetchResponseType.Length) {
+					// See note in _startBackgroundSummarization — truncated partial completion
+					// is still usable; warn and fall through rather than failing the call.
+					rawResponseText = response.truncatedValue;
+					this.logService.warn(`[ConversationHistorySummarizer] prism background compaction response truncated by model length limit (${rawResponseText.length} chars)`);
+				} else {
 					throw formatCompactionFailureError(response as never);
 				}
-				const rawSummaryText = extractSummary(response.value);
+				const rawSummaryText = extractSummary(rawResponseText);
 				if (rawSummaryText === undefined) {
 					throw new Error('Background summarization: no <summary> tags found in response');
 				}
@@ -1264,17 +1295,17 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 					curTurnRoundIndex: numRoundsInCurrentTurn,
 					isDuringToolCalling: numRoundsInCurrentTurn > 0 ? 1 : 0,
 					duration: Date.now() - bgStartTime,
-					promptTokenCount: response.usage?.prompt_tokens,
-					promptCacheTokenCount: response.usage?.prompt_tokens_details?.cached_tokens,
-					responseTokenCount: response.usage?.completion_tokens,
+					promptTokenCount: responseUsage?.prompt_tokens,
+					promptCacheTokenCount: responseUsage?.prompt_tokens_details?.cached_tokens,
+					responseTokenCount: responseUsage?.completion_tokens,
 				});
 
 				return {
 					summary: summaryText,
 					toolCallRoundId,
-					promptTokens: response.usage?.prompt_tokens,
-					promptCacheTokens: response.usage?.prompt_tokens_details?.cached_tokens,
-					outputTokens: response.usage?.completion_tokens,
+					promptTokens: responseUsage?.prompt_tokens,
+					promptCacheTokens: responseUsage?.prompt_tokens_details?.cached_tokens,
+					outputTokens: responseUsage?.completion_tokens,
 					durationMs: Date.now() - bgStartTime,
 					model: compactionEndpoint.model,
 					summarizationMode: 'full',
@@ -1282,6 +1313,13 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 					numRoundsSinceLastSummarization,
 				};
 			} catch (err) {
+				// See note in _startBackgroundSummarization — cancellation is expected and
+				// shouldn't surface as an error log or telemetry failure.
+				if (bgToken.isCancellationRequested || isCancellationError(err)) {
+					this.logService.debug(`[ConversationHistorySummarizer] prism background compaction cancelled`);
+					throw err;
+				}
+
 				this.logService.error(err, `[ConversationHistorySummarizer] prism background compaction failed`);
 
 				this.telemetryService.sendMSFTTelemetryEvent('summarizedConversationHistory', {
