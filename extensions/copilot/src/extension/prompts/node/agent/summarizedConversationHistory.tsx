@@ -444,6 +444,22 @@ class PruningOccurredError extends Error {
 }
 
 /**
+ * Check whether `endpoint` matches the user-configured prism compaction model
+ * filter. The filter is a comma-separated list of case-insensitive substrings
+ * tested against both `endpoint.model` and `endpoint.family`. An empty filter
+ * means "no filter" and matches every model.
+ */
+function matchesPrismFilter(endpoint: IChatEndpoint, filter: string): boolean {
+	const tokens = filter.split(',').map(t => t.trim().toLowerCase()).filter(Boolean);
+	if (tokens.length === 0) {
+		return true;
+	}
+	const model = endpoint.model.toLowerCase();
+	const family = endpoint.family.toLowerCase();
+	return tokens.some(token => model.includes(token) || family.includes(token));
+}
+
+/**
  * Renders conversation history with tool calls and summaries, triggering summarization while rendering if necessary.
  */
 export class SummarizedConversationHistory extends PromptElement<SummarizedAgentHistoryProps> {
@@ -692,7 +708,8 @@ class ConversationHistorySummarizer {
 		// The on-path resolves a separate compaction endpoint via the standard CAPI
 		// endpoint provider.
 		const usePrismCompaction = this.configurationService.getExperimentBasedConfig(ConfigKey.ConversationUsePrismCompaction, this.experimentationService);
-		if (!usePrismCompaction) {
+		const prismModelFilter = this.configurationService.getExperimentBasedConfig(ConfigKey.ConversationPrismCompactionModelFilter, this.experimentationService);
+		if (!usePrismCompaction || !matchesPrismFilter(this.props.endpoint, prismModelFilter)) {
 			return this._getSummary(mode, propsInfo);
 		}
 		try {

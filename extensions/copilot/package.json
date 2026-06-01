@@ -4245,6 +4245,15 @@
               "experimental",
               "onExp"
             ]
+          },
+          "github.copilot.chat.conversationCompaction.prismModelFilter": {
+            "type": "string",
+            "default": "haiku,sonnet,gemini",
+            "markdownDescription": "%github.copilot.config.conversationCompaction.prismModelFilter%",
+            "tags": [
+              "experimental",
+              "onExp"
+            ]
           }
         }
       },
