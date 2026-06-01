@@ -53,7 +53,7 @@ import { BackgroundSummarizationState, BackgroundSummarizationThresholds, Backgr
 import { BackgroundTodoDecision, BackgroundTodoProcessor, IBackgroundTodoExecutionContext } from '../../prompts/node/agent/backgroundTodoProcessor';
 import { formatCompactionFailureError, renderCompactionMessages, resolveCompactionEndpoint } from '../../prompts/node/agent/compactionEndpoint';
 import { AgentPromptCustomizations, PromptRegistry } from '../../prompts/node/agent/promptRegistry';
-import { extractSummary, matchesPrismFilter, SummarizationUserMessage, SummarizedConversationHistory, SummarizedConversationHistoryMetadata, SummarizedConversationHistoryPropsBuilder, appendTranscriptHintToSummary, computeSummarizationRoundCounts } from '../../prompts/node/agent/summarizedConversationHistory';
+import { extractSummary, decidePrismRouting, SummarizationUserMessage, SummarizedConversationHistory, SummarizedConversationHistoryMetadata, SummarizedConversationHistoryPropsBuilder, appendTranscriptHintToSummary, computeSummarizationRoundCounts } from '../../prompts/node/agent/summarizedConversationHistory';
 import { PromptRenderer, renderPromptElement } from '../../prompts/node/base/promptRenderer';
 import { ICodeMapperService } from '../../prompts/node/codeMapper/codeMapperService';
 import { EditCodePrompt2 } from '../../prompts/node/panel/editCodePrompt2';
@@ -406,6 +406,12 @@ export class AgentIntent extends EditCodeIntent {
 
 			stream.progress(l10n.t('Compacting conversation...'));
 
+			this._logService.debug(
+				`[ConversationHistorySummarizer] foreground compaction trigger: source=/compact, ` +
+				`agentEndpoint=${endpoint.model} (modelMaxPromptTokens=${endpoint.modelMaxPromptTokens}), ` +
+				`history.turns=${history.length}, history.rounds=${history.reduce((n, t) => n + t.rounds.length, 0)}`
+			);
+
 			const progress: vscode.Progress<vscode.ChatResponseReferencePart | vscode.ChatResponseProgressPart> = {
 				report: () => { }
 			};
@@ -696,7 +702,11 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 				return renderWithoutSummarization(`skipping repeated foreground summarization after prior failure (${previousForegroundSummary.outcome})`, renderProps);
 			}
 
-			this.logService.debug(`[ConversationHistorySummarizer] ${reason}, triggering summarization`);
+			this.logService.debug(
+				`[ConversationHistorySummarizer] foreground compaction trigger: source=${reason}, ` +
+				`agentEndpoint=${this.endpoint.model} (modelMaxPromptTokens=${this.endpoint.modelMaxPromptTokens}), ` +
+				`lastRenderTokenCount=${this._lastRenderTokenCount}`
+			);
 			try {
 				const renderer = PromptRenderer.create(this.instantiationService, this.endpoint, this.prompt, {
 					...renderProps,
@@ -848,25 +858,36 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 			const idleOrFailed = backgroundSummarizer.state === BackgroundSummarizationState.Idle
 				|| backgroundSummarizer.state === BackgroundSummarizationState.Failed;
 
+			// Single decision point shared with the foreground dispatcher in
+			// summarizedConversationHistory.tsx so prism gating stays consistent
+			// across both compaction paths.
+			const routingDecision = await decidePrismRouting(
+				this.endpoint,
+				effectivePostRender,
+				this.configurationService,
+				this.expService,
+				this._endpointProvider,
+				this.logService,
+			);
 			// The prism compaction path targets a separate endpoint, so it
 			// shares no prompt-cache prefix with the main agent loop. The
 			// cache-warm gate therefore has no rationale there and would only
 			// delay compaction; force `cacheWarm: true` so we fire as soon as
 			// the budget threshold is crossed.
-			const prismFlagEnabled = this.configurationService.getExperimentBasedConfig(ConfigKey.ConversationUsePrismCompaction, this.expService);
-			const prismModelFilter = this.configurationService.getExperimentBasedConfig(ConfigKey.ConversationPrismCompactionModelFilter, this.expService);
-			// Match the foreground dispatcher in summarizedConversationHistory.tsx:
-			// the model filter further restricts when prism applies. Empty filter
-			// matches every model.
-			const usePrismCompaction = prismFlagEnabled && matchesPrismFilter(this.endpoint, prismModelFilter);
-			const cacheWarm = usePrismCompaction
+			const cacheWarm = routingDecision.usePrism
 				? true
 				: (promptContext.toolCallRounds?.length ?? 0) > 0;
 
 			const kickOff = shouldKickOffBackgroundSummarization(postRenderRatio, cacheWarm, this._thresholdRng);
 
 			if (kickOff && idleOrFailed) {
-				if (usePrismCompaction) {
+				this.logService.debug(
+					`[ConversationHistorySummarizer] background compaction trigger: postRenderRatio=${postRenderRatio.toFixed(3)}, ` +
+					`contextTokens=${effectivePostRender}, baseBudget=${baseBudget}, cacheWarm=${cacheWarm}, ` +
+					`agentEndpoint=${this.endpoint.model} (modelMaxPromptTokens=${this.endpoint.modelMaxPromptTokens}), ` +
+					`routing: usePrism=${routingDecision.usePrism} — ${routingDecision.reason}`
+				);
+				if (routingDecision.usePrism) {
 					// Different endpoint → no shared cache prefix and no
 					// `_lastModelCapabilities` reuse; both are cache-parity
 					// machinery for the main-endpoint path.

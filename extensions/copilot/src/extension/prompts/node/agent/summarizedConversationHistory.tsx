@@ -460,6 +460,68 @@ export function matchesPrismFilter(endpoint: IChatEndpoint, filter: string): boo
 }
 
 /**
+ * Decision returned by {@link decidePrismRouting} — whether to use the prism
+ * compaction endpoint for an upcoming compaction request, the resolved
+ * compaction endpoint (when relevant), and a human-readable reason suitable
+ * for debug logging.
+ */
+export interface IPrismRoutingDecision {
+	readonly usePrism: boolean;
+	readonly reason: string;
+	/** Resolved compaction endpoint when the prism flag is on and the filter matches; undefined otherwise. */
+	readonly compactionEndpoint?: IChatEndpoint;
+}
+
+/**
+ * Single source of truth for "should this compaction request use the prism
+ * endpoint or the main agent endpoint?" Used by both the foreground dispatcher
+ * (`getSummary` here) and the background dispatcher in agentIntent.ts so the
+ * routing rules stay consistent.
+ *
+ * Decision order:
+ *   1. Prism flag disabled → main agent.
+ *   2. Agent model not in prism filter → main agent.
+ *   3. Known current context size exceeds compaction endpoint's prompt budget
+ *      AND main agent has more headroom → main agent (avoids pruning).
+ *   4. Otherwise → prism.
+ */
+export async function decidePrismRouting(
+	agentEndpoint: IChatEndpoint,
+	currentContextTokens: number | undefined,
+	configurationService: IConfigurationService,
+	experimentationService: IExperimentationService,
+	endpointProvider: IEndpointProvider,
+	logService: ILogService,
+): Promise<IPrismRoutingDecision> {
+	const usePrismFlag = configurationService.getExperimentBasedConfig(ConfigKey.ConversationUsePrismCompaction, experimentationService);
+	if (!usePrismFlag) {
+		return { usePrism: false, reason: 'prism flag disabled' };
+	}
+	const filter = configurationService.getExperimentBasedConfig(ConfigKey.ConversationPrismCompactionModelFilter, experimentationService);
+	if (!matchesPrismFilter(agentEndpoint, filter)) {
+		return {
+			usePrism: false,
+			reason: `agent model not in prism filter (model=${agentEndpoint.model}, family=${agentEndpoint.family}, filter=[${filter}])`,
+		};
+	}
+	const compactionEndpoint = await resolveCompactionEndpoint(agentEndpoint, configurationService, experimentationService, endpointProvider, logService);
+	if (currentContextTokens !== undefined
+		&& currentContextTokens > compactionEndpoint.modelMaxPromptTokens
+		&& agentEndpoint.modelMaxPromptTokens > compactionEndpoint.modelMaxPromptTokens) {
+		return {
+			usePrism: false,
+			reason: `current context (${currentContextTokens} tokens) exceeds compaction endpoint capacity (${compactionEndpoint.model}, modelMaxPromptTokens=${compactionEndpoint.modelMaxPromptTokens}); agent endpoint has more headroom (${agentEndpoint.model}, modelMaxPromptTokens=${agentEndpoint.modelMaxPromptTokens})`,
+			compactionEndpoint,
+		};
+	}
+	return {
+		usePrism: true,
+		reason: `prism enabled, agent model in filter, conversation fits compaction budget (currentContextTokens=${currentContextTokens ?? '?'}, compactionEndpoint=${compactionEndpoint.model}, compactionBudget=${compactionEndpoint.modelMaxPromptTokens}, agentBudget=${agentEndpoint.modelMaxPromptTokens})`,
+		compactionEndpoint,
+	};
+}
+
+/**
  * Renders conversation history with tool calls and summaries, triggering summarization while rendering if necessary.
  */
 export class SummarizedConversationHistory extends PromptElement<SummarizedAgentHistoryProps> {
@@ -703,17 +765,24 @@ class ConversationHistorySummarizer {
 	}
 
 	private async getSummary(mode: SummaryMode, propsInfo: ISummarizedConversationHistoryInfo): Promise<SummarizationResult> {
-		// Branch on the experiment flag so the off-path is the unmodified pre-PR
-		// code (uses `this.props.endpoint` directly with inline tool normalization).
-		// The on-path resolves a separate compaction endpoint via the standard CAPI
-		// endpoint provider.
-		const usePrismCompaction = this.configurationService.getExperimentBasedConfig(ConfigKey.ConversationUsePrismCompaction, this.experimentationService);
-		const prismModelFilter = this.configurationService.getExperimentBasedConfig(ConfigKey.ConversationPrismCompactionModelFilter, this.experimentationService);
-		if (!usePrismCompaction || !matchesPrismFilter(this.props.endpoint, prismModelFilter)) {
+		// Single decision point shared with the background dispatcher in
+		// agentIntent.ts — see decidePrismRouting for the routing rules.
+		const decision = await decidePrismRouting(
+			this.props.endpoint,
+			this.props.currentContextTokens,
+			this.configurationService,
+			this.experimentationService,
+			this.endpointProvider,
+			this.logService,
+		);
+		this.logService.debug(
+			`[ConversationHistorySummarizer] [${mode}] foreground compaction routing: usePrism=${decision.usePrism} — ${decision.reason}`
+		);
+		if (!decision.usePrism) {
 			return this._getSummary(mode, propsInfo);
 		}
 		try {
-			return await this._getSummaryPrism(mode, propsInfo);
+			return await this._getSummaryPrism(mode, propsInfo, decision.compactionEndpoint!);
 		} catch (e) {
 			if (isCancellationError(e)) {
 				throw e;
@@ -800,16 +869,8 @@ class ConversationHistorySummarizer {
 	 * options so the tool schema is normalised against the resolved endpoint's
 	 * family (which may differ from the main agent endpoint's family).
 	 */
-	private async _getSummaryPrism(mode: SummaryMode, propsInfo: ISummarizedConversationHistoryInfo): Promise<SummarizationResult> {
+	private async _getSummaryPrism(mode: SummaryMode, propsInfo: ISummarizedConversationHistoryInfo, compactionEndpoint: IChatEndpoint): Promise<SummarizationResult> {
 		const stopwatch = new StopWatch(false);
-
-		const compactionEndpoint = await resolveCompactionEndpoint(
-			this.props.endpoint,
-			this.configurationService,
-			this.experimentationService,
-			this.endpointProvider,
-			this.logService,
-		);
 
 		// Pre-check: if the last successful agent render was already larger than
 		// the compaction endpoint's prompt budget, the current conversation (at
