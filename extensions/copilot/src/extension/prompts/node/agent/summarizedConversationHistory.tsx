@@ -427,19 +427,16 @@ export interface SummarizedAgentHistoryProps extends BasePromptElementProps, Age
 
 /**
  * Thrown by the prism foreground compaction path when the conversation can't
- * fit the compaction endpoint without losing content. Detected either before
- * rendering (when `currentContextTokens` is already larger than the compaction
- * endpoint's budget) or after rendering (when prompt-tsx pruned one or more
- * nodes to fit). Caught by the `getSummary` dispatcher to fall back to the
- * agent endpoint, which typically has a larger context window.
+ * fit the compaction endpoint without losing content. Detected after rendering
+ * when prompt-tsx pruned one or more nodes to fit. Caught by the `getSummary`
+ * dispatcher to fall back to the agent endpoint.
  */
 class PruningOccurredError extends Error {
 	constructor(
 		readonly removedCount: number,
 		readonly tokenCount: number,
-		readonly detectionPoint: 'pre-check' | 'post-render',
 	) {
-		super(`Prism compaction would lose content (${detectionPoint}: removedCount=${removedCount}, tokenCount=${tokenCount})`);
+		super(`Prism compaction would lose content (post-render: removedCount=${removedCount}, tokenCount=${tokenCount})`);
 	}
 }
 
@@ -482,7 +479,7 @@ export interface IPrismRoutingDecision {
  *   1. Prism flag disabled → main agent.
  *   2. Agent model not in prism filter → main agent.
  *   3. Known current context size exceeds compaction endpoint's prompt budget
- *      AND main agent has more headroom → main agent (avoids pruning).
+ *      → main agent (avoids pruning; matches the pre-prism baseline).
  *   4. Otherwise → prism.
  */
 export async function decidePrismRouting(
@@ -505,18 +502,16 @@ export async function decidePrismRouting(
 		};
 	}
 	const compactionEndpoint = await resolveCompactionEndpoint(agentEndpoint, configurationService, experimentationService, endpointProvider, logService);
-	if (currentContextTokens !== undefined
-		&& currentContextTokens > compactionEndpoint.modelMaxPromptTokens
-		&& agentEndpoint.modelMaxPromptTokens > compactionEndpoint.modelMaxPromptTokens) {
+	if (currentContextTokens !== undefined && currentContextTokens > compactionEndpoint.modelMaxPromptTokens) {
 		return {
 			usePrism: false,
-			reason: `current context (${currentContextTokens} tokens) exceeds compaction endpoint capacity (${compactionEndpoint.model}, modelMaxPromptTokens=${compactionEndpoint.modelMaxPromptTokens}); agent endpoint has more headroom (${agentEndpoint.model}, modelMaxPromptTokens=${agentEndpoint.modelMaxPromptTokens})`,
+			reason: `current context (${currentContextTokens} tokens) exceeds compaction endpoint budget (${compactionEndpoint.model}, modelMaxPromptTokens=${compactionEndpoint.modelMaxPromptTokens})`,
 			compactionEndpoint,
 		};
 	}
 	return {
 		usePrism: true,
-		reason: `prism enabled, agent model in filter, conversation fits compaction budget (currentContextTokens=${currentContextTokens ?? '?'}, compactionEndpoint=${compactionEndpoint.model}, compactionBudget=${compactionEndpoint.modelMaxPromptTokens}, agentBudget=${agentEndpoint.modelMaxPromptTokens})`,
+		reason: `prism enabled, agent model in filter, conversation fits compaction budget (currentContextTokens=${currentContextTokens ?? '?'}, compactionEndpoint=${compactionEndpoint.model}, compactionBudget=${compactionEndpoint.modelMaxPromptTokens})`,
 		compactionEndpoint,
 	};
 }
@@ -789,8 +784,8 @@ class ConversationHistorySummarizer {
 			}
 			if (e instanceof PruningOccurredError) {
 				this.logService.warn(
-					`[ConversationHistorySummarizer] [${mode}] prism compaction endpoint cannot fit conversation without pruning ` +
-					`(${e.detectionPoint}: tokenCount=${e.tokenCount}, removedCount=${e.removedCount}). ` +
+					`[ConversationHistorySummarizer] [${mode}] prism compaction endpoint pruned content ` +
+					`(removedCount=${e.removedCount}, tokenCount=${e.tokenCount}). ` +
 					`Falling back to agent endpoint (model=${this.props.endpoint.model}, modelMaxPromptTokens=${this.props.endpoint.modelMaxPromptTokens}).`
 				);
 				return this._getSummary(mode, propsInfo);
@@ -872,18 +867,6 @@ class ConversationHistorySummarizer {
 	private async _getSummaryPrism(mode: SummaryMode, propsInfo: ISummarizedConversationHistoryInfo, compactionEndpoint: IChatEndpoint): Promise<SummarizationResult> {
 		const stopwatch = new StopWatch(false);
 
-		// Pre-check: if the last successful agent render was already larger than
-		// the compaction endpoint's prompt budget, the current conversation (at
-		// least that big) cannot fit the compaction endpoint without losing
-		// content. Skip the wasted prism render and go straight to the agent
-		// endpoint via the dispatcher's catch.
-		const lastContextSize = this.props.currentContextTokens;
-		if (lastContextSize !== undefined
-			&& lastContextSize > compactionEndpoint.modelMaxPromptTokens
-			&& this.props.endpoint.modelMaxPromptTokens > compactionEndpoint.modelMaxPromptTokens) {
-			throw new PruningOccurredError(0, lastContextSize, 'pre-check');
-		}
-
 		const tools = this.props.tools;
 		const toolTokens = mode === SummaryMode.Full && tools?.length
 			? await compactionEndpoint.acquireTokenizer().countToolTokens(tools)
@@ -898,10 +881,10 @@ class ConversationHistorySummarizer {
 
 		// Post-render check: prompt-tsx dropped nodes to fit the compaction
 		// endpoint's budget. The summary would be built from a truncated view of
-		// the conversation. Fall back to the agent endpoint when it has more
-		// headroom so the summary sees the full conversation instead.
-		if (removedCount > 0 && this.props.endpoint.modelMaxPromptTokens > compactionEndpoint.modelMaxPromptTokens) {
-			throw new PruningOccurredError(removedCount, renderedTokens, 'post-render');
+		// the conversation. Fall back to the agent endpoint (the pre-prism
+		// baseline) so the summary sees the full conversation instead.
+		if (removedCount > 0) {
+			throw new PruningOccurredError(removedCount, renderedTokens);
 		}
 
 		return this._executeSummarizationRequest(endpoint, mode, summarizationPrompt, () => mode === SummaryMode.Full ? buildCompactionToolOpts(
