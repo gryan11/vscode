@@ -53,7 +53,7 @@ import { BackgroundSummarizationState, BackgroundSummarizationThresholds, Backgr
 import { BackgroundTodoDecision, BackgroundTodoProcessor, IBackgroundTodoExecutionContext } from '../../prompts/node/agent/backgroundTodoProcessor';
 import { formatCompactionFailureError, renderCompactionMessages, resolveCompactionEndpoint } from '../../prompts/node/agent/compactionEndpoint';
 import { AgentPromptCustomizations, PromptRegistry } from '../../prompts/node/agent/promptRegistry';
-import { extractSummary, SummarizationUserMessage, SummarizedConversationHistory, SummarizedConversationHistoryMetadata, SummarizedConversationHistoryPropsBuilder, appendTranscriptHintToSummary, computeSummarizationRoundCounts } from '../../prompts/node/agent/summarizedConversationHistory';
+import { extractSummary, matchesPrismFilter, SummarizationUserMessage, SummarizedConversationHistory, SummarizedConversationHistoryMetadata, SummarizedConversationHistoryPropsBuilder, appendTranscriptHintToSummary, computeSummarizationRoundCounts } from '../../prompts/node/agent/summarizedConversationHistory';
 import { PromptRenderer, renderPromptElement } from '../../prompts/node/base/promptRenderer';
 import { ICodeMapperService } from '../../prompts/node/codeMapper/codeMapperService';
 import { EditCodePrompt2 } from '../../prompts/node/panel/editCodePrompt2';
@@ -853,7 +853,12 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 			// cache-warm gate therefore has no rationale there and would only
 			// delay compaction; force `cacheWarm: true` so we fire as soon as
 			// the budget threshold is crossed.
-			const usePrismCompaction = this.configurationService.getExperimentBasedConfig(ConfigKey.ConversationUsePrismCompaction, this.expService);
+			const prismFlagEnabled = this.configurationService.getExperimentBasedConfig(ConfigKey.ConversationUsePrismCompaction, this.expService);
+			const prismModelFilter = this.configurationService.getExperimentBasedConfig(ConfigKey.ConversationPrismCompactionModelFilter, this.expService);
+			// Match the foreground dispatcher in summarizedConversationHistory.tsx:
+			// the model filter further restricts when prism applies. Empty filter
+			// matches every model.
+			const usePrismCompaction = prismFlagEnabled && matchesPrismFilter(this.endpoint, prismModelFilter);
 			const cacheWarm = usePrismCompaction
 				? true
 				: (promptContext.toolCallRounds?.length ?? 0) > 0;

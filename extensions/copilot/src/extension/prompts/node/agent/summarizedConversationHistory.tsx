@@ -449,7 +449,7 @@ class PruningOccurredError extends Error {
  * tested against both `endpoint.model` and `endpoint.family`. An empty filter
  * means "no filter" and matches every model.
  */
-function matchesPrismFilter(endpoint: IChatEndpoint, filter: string): boolean {
+export function matchesPrismFilter(endpoint: IChatEndpoint, filter: string): boolean {
 	const tokens = filter.split(',').map(t => t.trim().toLowerCase()).filter(Boolean);
 	if (tokens.length === 0) {
 		return true;
