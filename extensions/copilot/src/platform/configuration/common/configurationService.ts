@@ -962,14 +962,14 @@ export namespace ConfigKey {
 	export const ConversationCompactionModel = defineSetting<string>('chat.conversationCompaction.model', ConfigType.ExperimentBased, '');
 
 	/**
-	 * Comma-separated list of model name/family substrings (case-insensitive) for
-	 * which prism compaction is applied. Only takes effect when
-	 * `ConversationUsePrismCompaction` is enabled. An empty value disables the
-	 * filter and applies prism to all models. The default targets families where
-	 * compaction tends to be slower or more expensive on the main agent model
-	 * (Anthropic haiku/sonnet, Gemini).
+	 * Comma-separated list of CAPI model IDs (case-insensitive, substring match
+	 * against both `endpoint.model` and `endpoint.family`) for which prism
+	 * compaction is applied. Only takes effect when `ConversationUsePrismCompaction`
+	 * is enabled. An empty value disables the filter and applies prism to all
+	 * models. The default targets the current Anthropic Haiku/Sonnet and Gemini
+	 * Pro models in the agent picker.
 	 */
-	export const ConversationPrismCompactionModelFilter = defineSetting<string>('chat.conversationCompaction.prismModelFilter', ConfigType.ExperimentBased, 'haiku,sonnet,gemini');
+	export const ConversationPrismCompactionModelFilter = defineSetting<string>('chat.conversationCompaction.prismModelFilter', ConfigType.ExperimentBased, 'claude-haiku-4.5,claude-sonnet-4.5,claude-sonnet-4.6,gemini-2.5-pro');
 
 	/** Use the Messages API instead of Chat Completions when supported */
 	export const UseAnthropicMessagesApi = defineSetting<boolean | undefined>('chat.anthropic.useMessagesApi', ConfigType.ExperimentBased, true);
