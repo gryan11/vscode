@@ -833,63 +833,113 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 		}
 
 		// Post-render: kick off background compaction if idle and over the
-		// threshold. Prompt cache parity with the main agent fetch matters
-		// here — so we gate kick-off on a completed tool call (cache has been
-		// warmed) and jitter the threshold around 0.80 to avoid firing at the
-		// same exact boundary every time.
+		// threshold. Top-level gate on the prism setting keeps the two paths
+		// visually separated — the production branch contains no prism
+		// references and stays byte-identical to pre-prism upstream; the
+		// prism branch owns the full prism feature (filter check, routing,
+		// fallback). The per-branch postRender/idleOrFailed/kickOff
+		// duplication is intentional and preferred over a shared prelude
+		// that would re-couple the paths.
 		if (summarizationEnabled && backgroundSummarizer && !didSummarizeThisIteration) {
-			const localPostRender = result.tokenCount + toolTokens;
-			const effectivePostRender = Math.max(localPostRender, lastTurnPromptTokens ?? 0);
-			const postRenderRatio = baseBudget > 0
-				? effectivePostRender / baseBudget
-				: 0;
-
-			const idleOrFailed = backgroundSummarizer.state === BackgroundSummarizationState.Idle
-				|| backgroundSummarizer.state === BackgroundSummarizationState.Failed;
-
-			// Single decision point shared with the foreground dispatcher in
-			// summarizedConversationHistory.tsx so prism gating stays consistent
-			// across both compaction paths.
-			const routingDecision = await decidePrismRouting(
-				this.endpoint,
-				this.configurationService,
+			const usePrismCompaction = this.configurationService.getExperimentBasedConfig(
+				ConfigKey.ConversationUsePrismCompaction,
 				this.expService,
-				this._endpointProvider,
-				this.logService,
 			);
-			// The prism compaction path targets a separate endpoint, so it
-			// shares no prompt-cache prefix with the main agent loop. The
-			// cache-warm gate therefore has no rationale there and would only
-			// delay compaction; force `cacheWarm: true` so we fire as soon as
-			// the budget threshold is crossed.
-			const cacheWarm = routingDecision.usePrism
-				? true
-				: (promptContext.toolCallRounds?.length ?? 0) > 0;
 
-			const kickOff = shouldKickOffBackgroundSummarization(postRenderRatio, cacheWarm, this._thresholdRng);
+			if (usePrismCompaction) {
+				// ── PRISM PATH ───────────────────────────────────────────────
+				// Filter is checked here (via the shared `decidePrismRouting`
+				// helper so foreground/background routing stay consistent).
+				// On filter-miss this branch falls through to a production-
+				// style kickoff so models excluded from prism still get
+				// background compaction — intentionally duplicated from the
+				// `else` branch below.
+				const localPostRender = result.tokenCount + toolTokens;
+				const effectivePostRender = Math.max(localPostRender, lastTurnPromptTokens ?? 0);
+				const postRenderRatio = baseBudget > 0
+					? effectivePostRender / baseBudget
+					: 0;
 
-			if (kickOff && idleOrFailed) {
+				const idleOrFailed = backgroundSummarizer.state === BackgroundSummarizationState.Idle
+					|| backgroundSummarizer.state === BackgroundSummarizationState.Failed;
+
+				const routingDecision = await decidePrismRouting(
+					this.endpoint,
+					this.configurationService,
+					this.expService,
+					this._endpointProvider,
+					this.logService,
+				);
+
 				if (routingDecision.usePrism) {
-					this.logService.debug(
-						`[ConversationHistorySummarizer] background compaction trigger: postRenderRatio=${postRenderRatio.toFixed(3)}, ` +
-						`contextTokens=${effectivePostRender}, baseBudget=${baseBudget}, cacheWarm=${cacheWarm}, ` +
-						`agentEndpoint=${this.endpoint.model} (modelMaxPromptTokens=${this.endpoint.modelMaxPromptTokens}), ` +
-						`routing: usePrism=true — ${routingDecision.reason}`
-					);
-					// Different endpoint → no shared cache prefix and no
-					// `_lastModelCapabilities` reuse; both are cache-parity
-					// machinery for the main-endpoint path.
-					this._startPrismBackgroundSummarization(backgroundSummarizer, promptContext, token, postRenderRatio);
+					// Prism endpoint shares no prompt-cache prefix with the
+					// main agent loop, so the cache-warm gate (a same-
+					// endpoint optimization) doesn't apply — force
+					// cacheWarm=true so compaction fires as soon as the
+					// budget threshold is crossed.
+					const cacheWarm = true;
+					const kickOff = shouldKickOffBackgroundSummarization(postRenderRatio, cacheWarm, this._thresholdRng);
+					if (kickOff && idleOrFailed) {
+						this.logService.debug(
+							`[ConversationHistorySummarizer] background compaction trigger: postRenderRatio=${postRenderRatio.toFixed(3)}, ` +
+							`contextTokens=${effectivePostRender}, baseBudget=${baseBudget}, cacheWarm=${cacheWarm}, ` +
+							`agentEndpoint=${this.endpoint.model} (modelMaxPromptTokens=${this.endpoint.modelMaxPromptTokens}), ` +
+							`routing: usePrism=true — ${routingDecision.reason}`
+						);
+						// Different endpoint → no shared cache prefix and no
+						// `_lastModelCapabilities` reuse; both are cache-
+						// parity machinery for the main-endpoint path.
+						this._startPrismBackgroundSummarization(backgroundSummarizer, promptContext, token, postRenderRatio);
+					}
 				} else {
-					// Compute and cache model capabilities from the current render's
-					// messages. These must match the main agent fetch for cache parity.
+					// Filter excluded this model from the prism path — run
+					// the production-style kickoff. Duplicated from the
+					// `else` branch below per the top-level "no shared
+					// prelude" rule.
+					const cacheWarm = (promptContext.toolCallRounds?.length ?? 0) > 0;
+					const kickOff = shouldKickOffBackgroundSummarization(postRenderRatio, cacheWarm, this._thresholdRng);
+					if (kickOff && idleOrFailed) {
+						const strippedMessages = ToolCallingLoop.stripInternalToolCallIds(result.messages);
+						const rawEffort = this.request.modelConfiguration?.reasoningEffort;
+						const isSubagent = !!this.request.subAgentInvocationId;
+						const shouldDisableThinking = !!promptContext.isContinuation && isAnthropicFamily(this.endpoint) && !ToolCallingLoop.messagesContainThinking(strippedMessages);
+						this._lastModelCapabilities = {
+							enableThinking: !shouldDisableThinking,
+							reasoningEffort: typeof rawEffort === 'string' ? rawEffort : undefined,
+							enableToolSearch: !isSubagent && !!this.endpoint.supportsToolSearch,
+							enableContextEditing: !isSubagent && isAnthropicContextEditingEnabled(this.endpoint, this.configurationService, this.expService),
+						};
+						this._startBackgroundSummarization(backgroundSummarizer, result.messages, promptContext, props, token, postRenderRatio);
+					}
+				}
+			} else {
+				// ── PRODUCTION PATH (byte-identical to pre-prism upstream) ──
+				// Prompt cache parity with the main agent fetch matters
+				// here — gate kick-off on a completed tool call (cache has
+				// been warmed) and jitter the threshold around 0.80 to
+				// avoid firing at the same exact boundary every time.
+				const localPostRender = result.tokenCount + toolTokens;
+				const effectivePostRender = Math.max(localPostRender, lastTurnPromptTokens ?? 0);
+				const postRenderRatio = baseBudget > 0
+					? effectivePostRender / baseBudget
+					: 0;
+
+				const idleOrFailed = backgroundSummarizer.state === BackgroundSummarizationState.Idle
+					|| backgroundSummarizer.state === BackgroundSummarizationState.Failed;
+
+				const cacheWarm = (promptContext.toolCallRounds?.length ?? 0) > 0;
+				const kickOff = shouldKickOffBackgroundSummarization(postRenderRatio, cacheWarm, this._thresholdRng);
+				if (kickOff && idleOrFailed) {
+					// Compute and cache model capabilities from the current
+					// render's messages. These must match the main agent
+					// fetch for cache parity. Must match the main agent's
+					// enableThinking logic in toolCallingLoop.ts runOne() —
+					// thinking is only disabled on continuation turns for
+					// Anthropic when no thinking blocks exist yet in the
+					// messages.
 					const strippedMessages = ToolCallingLoop.stripInternalToolCallIds(result.messages);
 					const rawEffort = this.request.modelConfiguration?.reasoningEffort;
 					const isSubagent = !!this.request.subAgentInvocationId;
-					// Must match the main agent's enableThinking logic in
-					// toolCallingLoop.ts runOne() — thinking is only disabled
-					// on continuation turns for Anthropic when no thinking
-					// blocks exist yet in the messages.
 					const shouldDisableThinking = !!promptContext.isContinuation && isAnthropicFamily(this.endpoint) && !ToolCallingLoop.messagesContainThinking(strippedMessages);
 					this._lastModelCapabilities = {
 						enableThinking: !shouldDisableThinking,
