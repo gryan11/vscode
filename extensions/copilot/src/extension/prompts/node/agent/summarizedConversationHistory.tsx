@@ -981,7 +981,17 @@ class ConversationHistorySummarizer {
 				location: ChatLocation.Agent,
 				requestOptions: {
 					temperature: 0,
-					stream: false,
+					// Intentionally do NOT set `stream: false`. The
+					// compaction endpoint (e.g. trajectory-compaction) is a
+					// Chat Completions model wired to the SSE response
+					// processor at construction time; setting stream:false
+					// would leave the processor in place while the server
+					// replies with a single JSON blob, triggering "Error
+					// parsing JSON stream data" and a spurious
+					// RESPONSE_CONTAINED_NO_CHOICES failure. The production
+					// off-flag path is safe because its Anthropic Messages
+					// API handler tolerates both streamed and non-streamed
+					// responses.
 					...toolOpts
 				},
 				telemetryProperties: associatedRequestId ? { associatedRequestId } : undefined,
