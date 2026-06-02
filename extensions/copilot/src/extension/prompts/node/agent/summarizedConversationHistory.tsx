@@ -418,12 +418,7 @@ export interface SummarizedAgentHistoryProps extends BasePromptElementProps, Age
 	readonly customizationsIndexUpdate?: { value: string; toolReferences: readonly ChatLanguageModelToolReference[] | undefined };
 }
 
-/**
- * Thrown by the prism foreground compaction path when the conversation can't
- * fit the compaction endpoint without losing content. Detected after rendering
- * when prompt-tsx pruned one or more nodes to fit. Caught by the `getSummary`
- * dispatcher to fall back to the agent endpoint.
- */
+/** Thrown by `_getSummaryPrism` when the compaction endpoint pruned content to fit; caught by `getSummary` to fall back to the agent endpoint. */
 class PruningOccurredError extends Error {
 	constructor(
 		readonly removedCount: number,
@@ -434,10 +429,8 @@ class PruningOccurredError extends Error {
 }
 
 /**
- * Check whether `endpoint` matches the user-configured prism compaction model
- * filter. The filter is a comma-separated list of case-insensitive substrings
- * tested against both `endpoint.model` and `endpoint.family`. An empty filter
- * means "no filter" and matches every model.
+ * Comma-separated, case-insensitive substring match against `endpoint.model`
+ * and `endpoint.family`. An empty filter matches every model.
  */
 export function matchesPrismFilter(endpoint: IChatEndpoint, filter: string): boolean {
 	const tokens = filter.split(',').map(t => t.trim().toLowerCase()).filter(Boolean);
@@ -449,12 +442,6 @@ export function matchesPrismFilter(endpoint: IChatEndpoint, filter: string): boo
 	return tokens.some(token => model.includes(token) || family.includes(token));
 }
 
-/**
- * Decision returned by {@link decidePrismRouting} — whether to use the prism
- * compaction endpoint for an upcoming compaction request, the resolved
- * compaction endpoint (when relevant), and a human-readable reason suitable
- * for debug logging.
- */
 interface IPrismRoutingDecision {
 	readonly usePrism: boolean;
 	readonly reason: string;
@@ -463,17 +450,10 @@ interface IPrismRoutingDecision {
 }
 
 /**
- * Single source of truth for "should this compaction request use the prism
- * endpoint or the main agent endpoint?" Used by both the foreground dispatcher
- * (`getSummary` here) and the background dispatcher in agentIntent.ts so the
- * routing rules stay consistent.
- *
- * Decision order:
- *   1. Prism flag disabled → main agent.
- *   2. Agent model not in prism filter → main agent.
- *   3. Otherwise → prism (the `_getSummaryPrism` post-render pruning check
- *      falls back to the agent endpoint when the conversation can't fit
- *      without losing content).
+ * Shared by foreground (`getSummary` here) and background (agentIntent.ts)
+ * dispatchers. Returns `usePrism: false` when the prism flag is disabled or
+ * the agent model is outside the filter; otherwise resolves the compaction
+ * endpoint and returns it.
  */
 export async function decidePrismRouting(
 	agentEndpoint: IChatEndpoint,
@@ -745,10 +725,6 @@ class ConversationHistorySummarizer {
 	}
 
 	private async getSummary(mode: SummaryMode, propsInfo: ISummarizedConversationHistoryInfo): Promise<SummarizationResult> {
-		// Top-level gate on the prism setting keeps the two paths visually
-		// separated — the off-flag branch is byte-identical to pre-prism
-		// upstream (no decidePrismRouting call, no prism imports); the prism
-		// branch owns the full prism feature (filter check, routing, fallback).
 		const usePrismCompaction = this.configurationService.getExperimentBasedConfig(
 			ConfigKey.ConversationUsePrismCompaction,
 			this.experimentationService,
@@ -757,11 +733,6 @@ class ConversationHistorySummarizer {
 			return this._getSummary(mode, propsInfo);
 		}
 
-		// ── PRISM PATH ───────────────────────────────────────────────────
-		// Filter is checked here (via the shared `decidePrismRouting` helper
-		// so foreground/background routing stay consistent). Any non-prism
-		// outcome (filter miss, pruning, prompt-too-long) falls back to the
-		// off-flag `_getSummary`.
 		const decision = await decidePrismRouting(
 			this.props.endpoint,
 			this.configurationService,
@@ -797,12 +768,7 @@ class ConversationHistorySummarizer {
 		}
 	}
 
-	/**
-	 * Detect render-time `BudgetExceededError` (prompt-tsx couldn't fit the prompt
-	 * into the endpoint's token budget) or a server-side `context_length_exceeded`
-	 * surfaced as a thrown Error. Both are prompt-too-long signals that warrant
-	 * falling back to the main agent endpoint (typically a larger context window).
-	 */
+	/** `BudgetExceededError` (prompt-tsx) or a server-side `context_length_exceeded` surfaced as a thrown Error. */
 	private _isPromptTooLongError(e: unknown): boolean {
 		if (e instanceof BudgetExceededError) {
 			return true;
@@ -811,14 +777,6 @@ class ConversationHistorySummarizer {
 		return /context[_ ]length[_ ]exceeded|prompt.*too long|maximum context length/i.test(message);
 	}
 
-	/**
-	 * Off-flag path. Body is byte-identical to the pre-prism `getSummary`:
-	 * uses the main agent endpoint, renders inline, normalises tools, issues
-	 * the chat request, and delegates response processing to the pre-prism
-	 * `handleSummarizationResponse`. Reached from `getSummary` when the prism
-	 * flag is disabled, when the prism filter excludes this model, and when
-	 * the prism path falls back on pruning / prompt-too-long.
-	 */
 	private async _getSummary(mode: SummaryMode, propsInfo: ISummarizedConversationHistoryInfo): Promise<SummarizationResult> {
 		const stopwatch = new StopWatch(false);
 
@@ -949,16 +907,9 @@ class ConversationHistorySummarizer {
 	}
 
 	/**
-	 * Prism (on-flag) path. Resolves a separate compaction endpoint via the
-	 * standard CAPI endpoint provider and routes the summarisation request
-	 * through it. Renders with a pruning-detection tracer so the dispatcher
-	 * can fall back to the agent endpoint when the conversation can't fit
-	 * without losing content. Tool options are built via the shared
-	 * `buildCompactionToolOpts` helper so the schema is normalised against
-	 * the resolved endpoint's family (which may differ from the main agent
-	 * endpoint's family). Response handling is delegated to the prism-only
-	 * `_handlePrismSummarizationResponse` which treats Length-truncated
-	 * responses as Success and attributes telemetry to the compaction model.
+	 * Prism (on-flag) path. Routes the summarisation request through the
+	 * resolved compaction endpoint, with a post-render pruning check that
+	 * falls back to the agent endpoint when content was dropped.
 	 */
 	private async _getSummaryPrism(mode: SummaryMode, propsInfo: ISummarizedConversationHistoryInfo, compactionEndpoint: IChatEndpoint): Promise<SummarizationResult> {
 		const stopwatch = new StopWatch(false);
@@ -1057,10 +1008,9 @@ class ConversationHistorySummarizer {
 	}
 
 	/**
-	 * Prism-only render variant that additionally captures a precise pruning
-	 * signal via a prompt-tsx tracer. Used by `_getSummaryPrism` to detect when
-	 * the compaction endpoint's smaller prompt budget caused nodes to be dropped
-	 * (in which case the caller falls back to the agent endpoint).
+	 * Prism-only render variant that captures the prompt-tsx `removedCount`
+	 * so `_getSummaryPrism` can fall back when the compaction endpoint's
+	 * smaller budget caused nodes to be dropped.
 	 */
 	private async _renderSummarizationPromptWithTracer(endpoint: IChatEndpoint, mode: SummaryMode, propsInfo: ISummarizedConversationHistoryInfo, stopwatch: StopWatch): Promise<{ messages: ChatMessage[]; tokenCount: number; removedCount: number }> {
 		try {
@@ -1070,10 +1020,10 @@ class ConversationHistorySummarizer {
 				ConversationHistorySummarizationPrompt,
 				{ ...propsInfo.props, enableCacheBreakpoints: false, simpleMode: mode === SummaryMode.Simple },
 			);
-			// Only attach the pruning-detection tracer when no other tracer is
-			// already in place — the dev `EnablePromptRendererTracing` config sets
-			// an `HTMLTracer` that the request logger downcasts to `HTMLTracer`,
-			// and replacing/chaining it would break that contract.
+			// Only attach when no other tracer is in place — the dev
+			// `EnablePromptRendererTracing` config sets an `HTMLTracer` that
+			// the request logger downcasts to `HTMLTracer`, and replacing
+			// it would break that contract.
 			let removedCount = 0;
 			if (!renderer.tracer) {
 				renderer.tracer = {
@@ -1122,16 +1072,14 @@ class ConversationHistorySummarizer {
 
 	/**
 	 * Prism-only response handler. Treats `Length`-truncated responses as
-	 * Success (the partial text is still usable as a summary) and attributes
-	 * all telemetry to the supplied `model` (the compaction endpoint's model)
-	 * rather than to `this.props.endpoint.model` so prism failures aren't
-	 * charged to the main agent endpoint.
+	 * Success (partial text is usable as a summary) and attributes telemetry
+	 * to the supplied `model` (the compaction endpoint) rather than the main
+	 * agent endpoint.
 	 */
 	private async _handlePrismSummarizationResponse(response: ChatResponse, mode: SummaryMode, elapsedTime: number, model: string, promptTypes?: string): Promise<FetchSuccess<string>> {
 		if (response.type === ChatFetchResponseType.Length) {
-			// Model hit its output token cap. The partial text is still usable
-			// as a summary, so surface a warning and synthesise a FetchSuccess
-			// instead of failing.
+			// Partial text is still usable as a summary — surface a warning
+			// and synthesise a FetchSuccess instead of failing.
 			this.logService.warn(`[ConversationHistorySummarizer] [${mode}] prism summarization response truncated by model length limit (${response.truncatedValue.length} chars). Using partial summary.`);
 			response = {
 				type: ChatFetchResponseType.Success,

@@ -944,30 +944,12 @@ export namespace ConfigKey {
 
 	export const RateLimitAutoSwitchToAuto = defineSetting<boolean>('chat.rateLimitAutoSwitchToAuto', ConfigType.Simple, false, vBoolean());
 
-	/**
-	 * Route conversation-history compaction (both foreground `/compact` and background auto-compaction)
-	 * through the dedicated `trajectory-compaction` model resolved via the standard CAPI endpoint
-	 * provider, instead of the main agent model.
-	 *
-	 * Registered in package.json so users can opt out explicitly; an explicit user `false` wins over
-	 * the experiment.
-	 */
+	/** Route conversation-history compaction through the dedicated `trajectory-compaction` CAPI model instead of the main agent model. */
 	export const ConversationUsePrismCompaction = defineSetting<boolean>('chat.conversationCompaction.usePrismCompaction', ConfigType.ExperimentBased, false);
-	/**
-	 * Override model name used for conversation-history compaction. When `ConversationUsePrismCompaction`
-	 * is enabled, this overrides the default `trajectory-compaction` model name. When disabled, an empty
-	 * value preserves the main agent model.
-	 */
+	/** Override the model used for compaction. Empty string keeps the default (`trajectory-compaction` when prism is on, agent model otherwise). */
 	export const ConversationCompactionModel = defineSetting<string>('chat.conversationCompaction.model', ConfigType.ExperimentBased, '');
 
-	/**
-	 * Comma-separated list of CAPI model IDs (case-insensitive, substring match
-	 * against both `endpoint.model` and `endpoint.family`) for which prism
-	 * compaction is applied. Only takes effect when `ConversationUsePrismCompaction`
-	 * is enabled. An empty value disables the filter and applies prism to all
-	 * models. The default targets the current Anthropic Haiku/Sonnet and Gemini
-	 * Pro models in the agent picker.
-	 */
+	/** Comma-separated CAPI model IDs (case-insensitive, substring match against model + family) opted into prism compaction. Empty = all models. */
 	export const ConversationPrismCompactionModelFilter = defineSetting<string>('chat.conversationCompaction.prismModelFilter', ConfigType.ExperimentBased, 'claude-haiku-4.5,claude-sonnet-4.5,claude-sonnet-4.6,gemini-2.5-pro,gemini-3-flash,gemini-3.5-flash');
 
 	/** Use the Messages API instead of Chat Completions when supported */

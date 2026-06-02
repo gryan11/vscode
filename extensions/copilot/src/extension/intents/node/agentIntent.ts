@@ -833,13 +833,10 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 		}
 
 		// Post-render: kick off background compaction if idle and over the
-		// threshold. Top-level gate on the prism setting keeps the two paths
-		// visually separated — the production branch contains no prism
-		// references and stays byte-identical to pre-prism upstream; the
-		// prism branch owns the full prism feature (filter check, routing,
-		// fallback). The per-branch postRender/idleOrFailed/kickOff
-		// duplication is intentional and preferred over a shared prelude
-		// that would re-couple the paths.
+		// threshold. Prompt cache parity with the main agent fetch matters
+		// here — so we gate kick-off on a completed tool call (cache has been
+		// warmed) and jitter the threshold around 0.80 to avoid firing at the
+		// same exact boundary every time.
 		if (summarizationEnabled && backgroundSummarizer && !didSummarizeThisIteration) {
 			const usePrismCompaction = this.configurationService.getExperimentBasedConfig(
 				ConfigKey.ConversationUsePrismCompaction,
@@ -847,13 +844,6 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 			);
 
 			if (usePrismCompaction) {
-				// ── PRISM PATH ───────────────────────────────────────────────
-				// Filter is checked here (via the shared `decidePrismRouting`
-				// helper so foreground/background routing stay consistent).
-				// On filter-miss this branch falls through to a production-
-				// style kickoff so models excluded from prism still get
-				// background compaction — intentionally duplicated from the
-				// `else` branch below.
 				const localPostRender = result.tokenCount + toolTokens;
 				const effectivePostRender = Math.max(localPostRender, lastTurnPromptTokens ?? 0);
 				const postRenderRatio = baseBudget > 0
@@ -872,11 +862,9 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 				);
 
 				if (routingDecision.usePrism) {
-					// Prism endpoint shares no prompt-cache prefix with the
-					// main agent loop, so the cache-warm gate (a same-
-					// endpoint optimization) doesn't apply — force
-					// cacheWarm=true so compaction fires as soon as the
-					// budget threshold is crossed.
+					// Prism endpoint shares no prompt-cache prefix with the main
+					// agent loop, so force cacheWarm=true to skip the cache-warm
+					// gate (a same-endpoint optimization).
 					const cacheWarm = true;
 					const kickOff = shouldKickOffBackgroundSummarization(postRenderRatio, cacheWarm, this._thresholdRng);
 					if (kickOff && idleOrFailed) {
@@ -886,16 +874,10 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 							`agentEndpoint=${this.endpoint.model} (modelMaxPromptTokens=${this.endpoint.modelMaxPromptTokens}), ` +
 							`routing: usePrism=true — ${routingDecision.reason}`
 						);
-						// Different endpoint → no shared cache prefix and no
-						// `_lastModelCapabilities` reuse; both are cache-
-						// parity machinery for the main-endpoint path.
 						this._startPrismBackgroundSummarization(backgroundSummarizer, promptContext, token, postRenderRatio);
 					}
 				} else {
-					// Filter excluded this model from the prism path — run
-					// the production-style kickoff. Duplicated from the
-					// `else` branch below per the top-level "no shared
-					// prelude" rule.
+					// Filter excluded this model — production-style kickoff.
 					const cacheWarm = (promptContext.toolCallRounds?.length ?? 0) > 0;
 					const kickOff = shouldKickOffBackgroundSummarization(postRenderRatio, cacheWarm, this._thresholdRng);
 					if (kickOff && idleOrFailed) {
@@ -913,11 +895,6 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 					}
 				}
 			} else {
-				// ── PRODUCTION PATH (byte-identical to pre-prism upstream) ──
-				// Prompt cache parity with the main agent fetch matters
-				// here — gate kick-off on a completed tool call (cache has
-				// been warmed) and jitter the threshold around 0.80 to
-				// avoid firing at the same exact boundary every time.
 				const localPostRender = result.tokenCount + toolTokens;
 				const effectivePostRender = Math.max(localPostRender, lastTurnPromptTokens ?? 0);
 				const postRenderRatio = baseBudget > 0
@@ -930,16 +907,15 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 				const cacheWarm = (promptContext.toolCallRounds?.length ?? 0) > 0;
 				const kickOff = shouldKickOffBackgroundSummarization(postRenderRatio, cacheWarm, this._thresholdRng);
 				if (kickOff && idleOrFailed) {
-					// Compute and cache model capabilities from the current
-					// render's messages. These must match the main agent
-					// fetch for cache parity. Must match the main agent's
-					// enableThinking logic in toolCallingLoop.ts runOne() —
-					// thinking is only disabled on continuation turns for
-					// Anthropic when no thinking blocks exist yet in the
-					// messages.
+					// Compute and cache model capabilities from the current render's
+					// messages. These must match the main agent fetch for cache parity.
 					const strippedMessages = ToolCallingLoop.stripInternalToolCallIds(result.messages);
 					const rawEffort = this.request.modelConfiguration?.reasoningEffort;
 					const isSubagent = !!this.request.subAgentInvocationId;
+					// Must match the main agent's enableThinking logic in
+					// toolCallingLoop.ts runOne() — thinking is only disabled
+					// on continuation turns for Anthropic when no thinking
+					// blocks exist yet in the messages.
 					const shouldDisableThinking = !!promptContext.isContinuation && isAnthropicFamily(this.endpoint) && !ToolCallingLoop.messagesContainThinking(strippedMessages);
 					this._lastModelCapabilities = {
 						enableThinking: !shouldDisableThinking,
@@ -1225,13 +1201,10 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 
 	/**
 	 * Prism background-compaction path: routes the trajectory-compaction
-	 * request to a separately resolved CAPI endpoint
-	 * (`ConversationUsePrismCompaction`). Since the target model differs from
-	 * the main agent endpoint, the cache-parity machinery used by
-	 * `_startBackgroundSummarization` (re-using the main render, forwarding
-	 * tools, threading `_lastModelCapabilities`) doesn't apply. Instead, the
-	 * prompt is re-rendered against the compaction endpoint via
-	 * `_renderCrossEndpointCompactionMessages` and sent without tools.
+	 * request to a separately resolved CAPI endpoint. The cache-parity
+	 * machinery used by `_startBackgroundSummarization` doesn't apply since
+	 * the target model differs from the agent endpoint; the prompt is
+	 * re-rendered against the compaction endpoint and sent without tools.
 	 */
 	private _startPrismBackgroundSummarization(
 		backgroundSummarizer: BackgroundSummarizer,
@@ -1253,9 +1226,9 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 		const conversationId = promptContext.conversation?.sessionId;
 
 		backgroundSummarizer.start(async bgToken => {
-			// Hoisted so the failure-telemetry block below can attribute the outcome to
-			// the resolved compaction endpoint (not the main agent model). Undefined if
-			// resolution itself threw, in which case we fall back to the agent model.
+			// Hoisted so the failure-telemetry block below can attribute the
+			// outcome to the resolved compaction endpoint. Undefined if
+			// resolution itself threw — fall back to the agent model.
 			let compactionEndpoint: IChatEndpoint | undefined;
 			try {
 				compactionEndpoint = await resolveCompactionEndpoint(
@@ -1276,10 +1249,10 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 					return;
 				}
 				const messages = rendered.messages;
-				// Trust the foreground-style propsBuilder over the bg's upfront
-				// round-id heuristic — the helper just rendered the prompt that
-				// summarizes up through `rendered.summarizedToolCallRoundId`, so
-				// the resulting summary must be attached to that same round.
+				// Trust the freshly-rendered round id — the helper rendered
+				// the prompt that summarizes up through
+				// `rendered.summarizedToolCallRoundId`, so the resulting
+				// summary must attach to that same round.
 				const toolCallRoundId = rendered.summarizedToolCallRoundId;
 
 				const response = await compactionEndpoint.makeChatRequest2({
@@ -1362,10 +1335,10 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 					numRoundsSinceLastSummarization,
 				};
 			} catch (err) {
-				// Token-driven cancellation (turn end, /compact, session dispose, endpoint switch)
-				// is expected — the outer BackgroundSummarizer.start discards the result. Don't
-				// log as error or telemeter as a failure; rethrow so the outer state machine still
-				// transitions consistently.
+				// Token-driven cancellation is expected — the outer
+				// BackgroundSummarizer.start discards the result. Don't log
+				// or telemeter as a failure; rethrow so the outer state
+				// machine still transitions.
 				if (bgToken.isCancellationRequested || isCancellationError(err)) {
 					this.logService.debug(`[ConversationHistorySummarizer] prism background compaction cancelled`);
 					throw err;
@@ -1406,13 +1379,9 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 	}
 
 	/**
-	 * Cross-endpoint re-render of the compaction prompt — used when the prism
-	 * compaction model differs from the main agent endpoint. Sacrifices
-	 * cache-prefix parity (impossible across endpoints anyway) for correctness:
-	 * the alternative is sending Anthropic/Gemini-shaped content to a model
-	 * that doesn't understand it and returns empty completions. Tools are
-	 * intentionally omitted; the cross-endpoint render's summarization prompt
-	 * is self-contained.
+	 * Cross-endpoint re-render of the compaction prompt — needed when the
+	 * prism compaction model differs from the main agent endpoint. Tools are
+	 * intentionally omitted; the summarization prompt is self-contained.
 	 */
 	private async _renderCrossEndpointCompactionMessages(
 		compactionEndpoint: IChatEndpoint,

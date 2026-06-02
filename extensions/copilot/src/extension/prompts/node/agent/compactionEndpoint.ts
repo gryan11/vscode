@@ -21,21 +21,14 @@ import { normalizeToolSchema } from '../../../tools/common/toolSchemaNormalizer'
 import { renderPromptElement } from '../base/promptRenderer';
 import { ConversationHistorySummarizationPrompt, replaceImageContentWithPlaceholders, stripCacheBreakpoints, stripToolSearchMessages, SummarizedConversationHistoryPropsBuilder } from './summarizedConversationHistory';
 
-/** Default CAPI model family used for trajectory-compaction when `ConversationUsePrismCompaction` is enabled without an explicit `ConversationCompactionModel`. */
+/** Default CAPI model family used for trajectory-compaction when `ConversationUsePrismCompaction` is enabled. */
 export const DEFAULT_COMPACTION_MODEL = 'trajectory-compaction';
 
 /**
- * Resolve the endpoint to use for trajectory (conversation-history) compaction:
- *
- *   - When `ConversationUsePrismCompaction` is enabled, the configured model
- *     (or `DEFAULT_COMPACTION_MODEL`) is resolved through the standard CAPI
- *     endpoint provider — i.e. the same path as any other Copilot chat model.
- *   - When only `ConversationCompactionModel` is set, the endpoint provider is
- *     asked for that model directly.
- *   - With neither configured, `mainEndpoint` is returned unchanged.
- *
- * Any failure to resolve the requested model falls back to `mainEndpoint` so a
- * misconfigured experiment never aborts the agent loop.
+ * Resolve the endpoint to use for trajectory (conversation-history) compaction.
+ * When `ConversationUsePrismCompaction` is on, resolves the configured model
+ * (or `DEFAULT_COMPACTION_MODEL`) via the standard CAPI endpoint provider.
+ * Falls back to `mainEndpoint` if no model is configured or resolution fails.
  */
 export async function resolveCompactionEndpoint(
 	mainEndpoint: IChatEndpoint,
@@ -63,13 +56,7 @@ export async function resolveCompactionEndpoint(
 	}
 }
 
-/**
- * Build the `Error` thrown when a compaction request returns a non-success
- * `ChatResponse`. Surfaces enough diagnostic detail to identify the root
- * cause without the chat debug log: most notably
- * `RESPONSE_CONTAINED_NO_CHOICES` lives on `reason`, not `type` (which would
- * be `unknown` for that case).
- */
+/** `Error` for non-success compaction `ChatResponse`. `reason` carries the CAPI failure detail (e.g. `RESPONSE_CONTAINED_NO_CHOICES`). */
 export function formatCompactionFailureError(response: { readonly type: string;[k: string]: unknown }): Error {
 	const reason = typeof response.reason === 'string' ? response.reason : undefined;
 	const requestId = typeof response.requestId === 'string' ? response.requestId : undefined;
@@ -77,29 +64,17 @@ export function formatCompactionFailureError(response: { readonly type: string;[
 }
 
 /**
- * Shared request options for trajectory-compaction calls.
- *
- * The compaction prompt instructs the model to emit a `<summary>` tag and to
- * NOT invoke any tools. The actual tool definitions are still forwarded so
- * the prompt prefix (system + tools + messages) is byte-identical to the
- * surrounding agent loop, which preserves cache hits on the main endpoint.
- *
- * The hard guarantee that the model never tries to call a tool lives in
- * `tool_choice: 'none'`. Text-summarization-only models such as
- * `trajectory-compaction` empirically return empty completions
- * (`RESPONSE_CONTAINED_NO_CHOICES`) when offered tools with the default
- * `tool_choice: 'auto'`. Foreground (`/compact`) has always set it; the
- * background auto-compaction path was missing it and is now aligned via this
- * shared helper.
+ * Tool options for a compaction request. `tool_choice: 'none'` is the hard
+ * guarantee that the model never tries to call a tool; text-summarization-only
+ * models such as `trajectory-compaction` empirically return empty completions
+ * (`RESPONSE_CONTAINED_NO_CHOICES`) when offered tools with default `'auto'`.
  */
 export type CompactionToolOpts = { readonly tool_choice: 'none'; readonly tools: OpenAiFunctionTool[] };
 
 /**
- * Build the `{ tool_choice, tools }` slice of a compaction request body from
- * the agent loop's available tools, normalised against the target endpoint's
- * model family. Returns `undefined` when there are no tools to forward (in
- * which case `tool_choice` MUST also be omitted — sending `tool_choice` with
- * no tools is rejected by CAPI as a 400).
+ * Normalise `availableTools` against `targetFamily` and return the
+ * `{ tool_choice, tools }` slice for a compaction request body, or `undefined`
+ * when there are no tools to forward.
  */
 export function buildCompactionToolOpts(
 	availableTools: ReadonlyArray<LanguageModelToolInformation> | undefined,
@@ -128,22 +103,11 @@ export function buildCompactionToolOpts(
 }
 
 /**
- * Render conversation-history compaction messages against an arbitrary
- * endpoint, mirroring the cleanup the foreground (`/compact`) path applies in
- * `ConversationHistorySummarizer.getSummary`.
+ * Render and clean up the compaction prompt against `endpoint` — mirrors the
+ * foreground `getSummary` flow (cache breakpoints → images → tool ids → family
+ * strips). Returns `undefined` when there is nothing to summarize.
  *
- * Used from the background auto-compaction path when the resolved compaction
- * endpoint differs from the main agent endpoint (e.g. when prism compaction
- * is enabled): the main-agent render is shaped for the main endpoint's model
- * family and the target model would either reject it or return empty
- * completions.
- *
- * Returns `undefined` when there is nothing to summarize (no rounds yet).
- *
- * NOTE: The cleanup orchestration (cache breakpoints → images → tool ids →
- * family-specific strips) is duplicated with the foreground path. Each
- * cleanup step is a single function call, so the duplication is glue rather
- * than logic. If you add a step in one place, mirror it here.
+ * If you add a cleanup step in the foreground path, mirror it here.
  */
 export async function renderCompactionMessages(
 	endpoint: IChatEndpoint,
