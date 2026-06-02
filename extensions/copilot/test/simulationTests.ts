@@ -38,6 +38,7 @@ import './prompts/gitCommitMessageGenerator.stest';
 import './prompts/newNotebookCell.stest';
 import './prompts/newWorkspace.stest';
 import './prompts/settingsEditorSearchResultsSelector.stest';
+import './simulation/compactionPrism.stest';
 import './simulation/debugCommandToConfig.stest';
 import './simulation/debugTools.stest';
 import './simulation/inlineEdit/inlineEdit.stest';

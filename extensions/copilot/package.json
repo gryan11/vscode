@@ -6811,6 +6811,7 @@
     "get_token": "tsx script/setup/getToken.mts",
     "prettier": "prettier --list-different --write --cache .",
     "simulate": "node dist/simulationMain.js",
+    "test:smoke:compaction-prism": "node dist/simulationMain.js --grep \"Compaction Prism\" --skip-cache --skip-model-cache -n=1 -p=1",
     "simulate-require-cache": "node dist/simulationMain.js --require-cache",
     "simulate-ci": "node dist/simulationMain.js --ci --require-cache",
     "simulate-update-baseline": "node dist/simulationMain.js --update-baseline",
