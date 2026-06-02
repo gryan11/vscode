@@ -730,9 +730,14 @@ class ConversationHistorySummarizer {
 			this.experimentationService,
 		);
 		if (!usePrismCompaction) {
+			// Production path (off-flag): byte-identical to pre-prism upstream.
 			return this._getSummary(mode, propsInfo);
 		}
 
+		// Prism experiment path: route compaction through the trajectory-
+		// compaction CAPI endpoint when the agent model passes the filter.
+		// Any non-prism outcome (filter miss, pruning, prompt-too-long) falls
+		// back to the production `_getSummary`.
 		const decision = await decidePrismRouting(
 			this.props.endpoint,
 			this.configurationService,

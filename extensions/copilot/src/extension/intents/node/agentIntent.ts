@@ -844,6 +844,8 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 			);
 
 			if (usePrismCompaction) {
+				// Prism experiment path: route compaction kick-off through the
+				// trajectory-compaction CAPI endpoint (subject to filter).
 				const localPostRender = result.tokenCount + toolTokens;
 				const effectivePostRender = Math.max(localPostRender, lastTurnPromptTokens ?? 0);
 				const postRenderRatio = baseBudget > 0
@@ -895,6 +897,7 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 					}
 				}
 			} else {
+				// Production path (off-flag): byte-identical to pre-prism upstream.
 				const localPostRender = result.tokenCount + toolTokens;
 				const effectivePostRender = Math.max(localPostRender, lastTurnPromptTokens ?? 0);
 				const postRenderRatio = baseBudget > 0
