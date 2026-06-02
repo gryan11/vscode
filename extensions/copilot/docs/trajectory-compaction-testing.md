@@ -199,6 +199,39 @@ would (typically `https://api.individual.githubcopilot.com`). It sends the
 **same conversation body** as the proxy smoke, so a green CAPI smoke means
 the extension's compaction-applier will also succeed against this route.
 
+### 9c. End-to-end integration smoke (WIP — dev only)
+
+`test/simulation/compactionPrism.stest.ts` exercises the production
+`ConversationHistorySummarizer` through real CAPI to catch
+client/server contract regressions (e.g. the `stream:false` /
+SSE-parser mismatch that the unit tests' mocked endpoint cannot
+catch).
+
+```bash
+# requires GITHUB_OAUTH_TOKEN — the cache from step 9b works:
+GITHUB_OAUTH_TOKEN=$(jq -r .github_access_token \
+  ~/.copilot-capi-smoke-auth.json) \
+  npm run --prefix extensions/copilot test:smoke:compaction-prism
+```
+
+Three cases, each routed through the real `IChatEndpoint.makeChatRequest2`
+path (no caching of model responses):
+
+| Case | `usePrism` | filter | Expected route |
+|---|---|---|---|
+| off-flag | false | (default) | agent model |
+| prism + match | true | (default) | `trajectory-compaction` |
+| prism + miss | true | `no-match-anywhere` | agent model |
+
+**Known issue (resolution pending):** The simulation framework's
+`RequestType.Models` call returns an HTML page instead of JSON under
+`GITHUB_OAUTH_TOKEN` auth, even when `devTrajectoryCompactionCapiSmoke.js`
+succeeds against the same Copilot token in the same shell. The two
+paths target different CAPI base URLs (smoke script auto-discovers
+`endpoints.api` per-account; framework hardcodes via `IDomainService`).
+The harness is committed and runs the matrix end-to-end as soon as
+that's resolved — track in the commit message of `2bba12fb997`.
+
 ## 10. Disable the flight
 
 Either remove the setting or set:
