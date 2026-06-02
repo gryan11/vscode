@@ -1205,8 +1205,12 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 		const conversationId = promptContext.conversation?.sessionId;
 
 		backgroundSummarizer.start(async bgToken => {
+			// Hoisted so the failure-telemetry block below can attribute the outcome to
+			// the resolved compaction endpoint (not the main agent model). Undefined if
+			// resolution itself threw, in which case we fall back to the agent model.
+			let compactionEndpoint: IChatEndpoint | undefined;
 			try {
-				const compactionEndpoint = await resolveCompactionEndpoint(
+				compactionEndpoint = await resolveCompactionEndpoint(
 					this.endpoint,
 					this.configurationService,
 					this.expService,
@@ -1324,7 +1328,7 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 				this.telemetryService.sendMSFTTelemetryEvent('summarizedConversationHistory', {
 					outcome: 'failed',
 					detailedOutcome: err instanceof Error ? err.message : String(err),
-					model: this.endpoint.model,
+					model: compactionEndpoint?.model ?? this.endpoint.model,
 					summarizationMode: 'full',
 					conversationId,
 					chatRequestId: associatedRequestId,
