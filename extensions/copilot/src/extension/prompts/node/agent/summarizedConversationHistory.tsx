@@ -42,7 +42,7 @@ import { PromptRenderer, renderPromptElement } from '../base/promptRenderer';
 import { Tag } from '../base/tag';
 import { ChatToolCalls } from '../panel/toolCalling';
 import { AgentUserMessage, AgentUserMessageCustomizations, getUserMessagePropsFromAgentProps, getUserMessagePropsFromTurn } from './agentPrompt';
-import { CompactionToolOpts, buildCompactionToolOpts, resolveCompactionEndpoint } from './compactionEndpoint';
+import { buildCompactionToolOpts, resolveCompactionEndpoint } from './compactionEndpoint';
 import { DefaultOpenAIKeepGoingReminder } from './openai/defaultOpenAIPrompt';
 import { SimpleSummarizedHistory } from './simpleSummarizedHistoryPrompt';
 
@@ -745,8 +745,23 @@ class ConversationHistorySummarizer {
 	}
 
 	private async getSummary(mode: SummaryMode, propsInfo: ISummarizedConversationHistoryInfo): Promise<SummarizationResult> {
-		// Single decision point shared with the background dispatcher in
-		// agentIntent.ts — see decidePrismRouting for the routing rules.
+		// Top-level gate on the prism setting keeps the two paths visually
+		// separated — the off-flag branch is byte-identical to pre-prism
+		// upstream (no decidePrismRouting call, no prism imports); the prism
+		// branch owns the full prism feature (filter check, routing, fallback).
+		const usePrismCompaction = this.configurationService.getExperimentBasedConfig(
+			ConfigKey.ConversationUsePrismCompaction,
+			this.experimentationService,
+		);
+		if (!usePrismCompaction) {
+			return this._getSummary(mode, propsInfo);
+		}
+
+		// ── PRISM PATH ───────────────────────────────────────────────────
+		// Filter is checked here (via the shared `decidePrismRouting` helper
+		// so foreground/background routing stay consistent). Any non-prism
+		// outcome (filter miss, pruning, prompt-too-long) falls back to the
+		// off-flag `_getSummary`.
 		const decision = await decidePrismRouting(
 			this.props.endpoint,
 			this.configurationService,
@@ -797,9 +812,12 @@ class ConversationHistorySummarizer {
 	}
 
 	/**
-	 * Off-flag path. Behaviour identical to the pre-PR `getSummary`:
-	 * uses the main agent endpoint, normalises tools inline, and forwards the
-	 * shared message-processing/request work to `_executeSummarizationRequest`.
+	 * Off-flag path. Body is byte-identical to the pre-prism `getSummary`:
+	 * uses the main agent endpoint, renders inline, normalises tools, issues
+	 * the chat request, and delegates response processing to the pre-prism
+	 * `handleSummarizationResponse`. Reached from `getSummary` when the prism
+	 * flag is disabled, when the prism filter excludes this model, and when
+	 * the prism path falls back on pruning / prompt-too-long.
 	 */
 	private async _getSummary(mode: SummaryMode, propsInfo: ISummarizedConversationHistoryInfo): Promise<SummarizationResult> {
 		const stopwatch = new StopWatch(false);
@@ -816,10 +834,22 @@ class ConversationHistorySummarizer {
 				Math.max(1, Math.floor((this.props.endpoint.modelMaxPromptTokens - toolTokens) * 0.9)))
 			: this.props.endpoint;
 
+		let summarizationPrompt: ChatMessage[];
 		const associatedRequestId = this.props.promptContext.conversation?.getLatestTurn().id;
-		const summarizationPrompt = await this._renderSummarizationPrompt(endpoint, mode, propsInfo, stopwatch);
+		try {
+			summarizationPrompt = (await renderPromptElement(this.instantiationService, endpoint, ConversationHistorySummarizationPrompt, { ...propsInfo.props, enableCacheBreakpoints: false, simpleMode: mode === SummaryMode.Simple }, undefined, this.token)).messages;
+			this.logInfo(`summarization prompt rendered in ${stopwatch.elapsed()}ms.`, mode);
+		} catch (e) {
+			const budgetExceeded = e instanceof BudgetExceededError;
+			const outcome = budgetExceeded ? 'budget_exceeded' : 'renderError';
+			this.logInfo(`Error rendering summarization prompt in mode: ${mode}. ${e.stack}`, mode);
+			this.sendSummarizationTelemetry(outcome, '', this.props.endpoint.model, mode, stopwatch.elapsed(), undefined, e instanceof Error ? e.message : String(e));
+			throw e;
+		}
 
-		return this._executeSummarizationRequest(endpoint, mode, summarizationPrompt, () => {
+		let summaryResponse: ChatResponse;
+		let promptTypes: string | undefined;
+		try {
 			const normalizedTools = mode === SummaryMode.Full ? normalizeToolSchema(
 				endpoint.family,
 				this.props.tools?.map(tool => ({
@@ -834,119 +864,10 @@ class ConversationHistorySummarizer {
 					this.logService.warn(`[ConversationHistorySummarizer] Tool ${tool} failed validation: ${rule}`);
 				},
 			) : undefined;
-			return normalizedTools?.length ? {
+			const toolOpts = normalizedTools?.length ? {
 				tool_choice: 'none' as const,
 				tools: normalizedTools,
 			} : undefined;
-		}, associatedRequestId, stopwatch);
-	}
-
-	/**
-	 * Prism (on-flag) path. Resolves a separate compaction endpoint via the
-	 * standard CAPI endpoint provider and routes the summarisation request
-	 * through it. Uses the shared `buildCompactionToolOpts` helper for tool
-	 * options so the tool schema is normalised against the resolved endpoint's
-	 * family (which may differ from the main agent endpoint's family).
-	 */
-	private async _getSummaryPrism(mode: SummaryMode, propsInfo: ISummarizedConversationHistoryInfo, compactionEndpoint: IChatEndpoint): Promise<SummarizationResult> {
-		const stopwatch = new StopWatch(false);
-
-		const tools = this.props.tools;
-		const toolTokens = mode === SummaryMode.Full && tools?.length
-			? await compactionEndpoint.acquireTokenizer().countToolTokens(tools)
-			: 0;
-		const endpoint = toolTokens > 0
-			? compactionEndpoint.cloneWithTokenOverride(
-				Math.max(1, Math.floor((compactionEndpoint.modelMaxPromptTokens - toolTokens) * 0.9)))
-			: compactionEndpoint;
-
-		const associatedRequestId = this.props.promptContext.conversation?.getLatestTurn().id;
-		const { messages: summarizationPrompt, tokenCount: renderedTokens, removedCount } = await this._renderSummarizationPromptWithTracer(endpoint, mode, propsInfo, stopwatch);
-
-		// Post-render check: prompt-tsx dropped nodes to fit the compaction
-		// endpoint's budget. The summary would be built from a truncated view of
-		// the conversation. Fall back to the agent endpoint (the pre-prism
-		// baseline) so the summary sees the full conversation instead.
-		if (removedCount > 0) {
-			throw new PruningOccurredError(removedCount, renderedTokens);
-		}
-
-		return this._executeSummarizationRequest(endpoint, mode, summarizationPrompt, () => mode === SummaryMode.Full ? buildCompactionToolOpts(
-			this.props.tools,
-			endpoint.family,
-			(tool, rule) => {
-				this.logService.warn(`[ConversationHistorySummarizer] Tool ${tool} failed validation: ${rule}`);
-			},
-		) : undefined, associatedRequestId, stopwatch, /* treatLengthAsSuccess */ true);
-	}
-
-	/**
-	 * Render the conversation-history summarization prompt against `endpoint`.
-	 * Emits the `renderError` / `budget_exceeded` telemetry and re-throws on
-	 * failure so the caller can bail out uniformly.
-	 */
-	private async _renderSummarizationPrompt(endpoint: IChatEndpoint, mode: SummaryMode, propsInfo: ISummarizedConversationHistoryInfo, stopwatch: StopWatch): Promise<ChatMessage[]> {
-		try {
-			const summarizationPrompt = (await renderPromptElement(this.instantiationService, endpoint, ConversationHistorySummarizationPrompt, { ...propsInfo.props, enableCacheBreakpoints: false, simpleMode: mode === SummaryMode.Simple }, undefined, this.token)).messages;
-			this.logInfo(`summarization prompt rendered in ${stopwatch.elapsed()}ms.`, mode);
-			return summarizationPrompt;
-		} catch (e) {
-			const budgetExceeded = e instanceof BudgetExceededError;
-			const outcome = budgetExceeded ? 'budget_exceeded' : 'renderError';
-			this.logInfo(`Error rendering summarization prompt in mode: ${mode}. ${e.stack}`, mode);
-			this.sendSummarizationTelemetry(outcome, '', endpoint.model, mode, stopwatch.elapsed(), undefined, e instanceof Error ? e.message : String(e));
-			throw e;
-		}
-	}
-
-	/**
-	 * Prism-only render variant that additionally captures a precise pruning
-	 * signal via a prompt-tsx tracer. Used by `_getSummaryPrism` to detect when
-	 * the compaction endpoint's smaller prompt budget caused nodes to be dropped
-	 * (in which case the caller falls back to the agent endpoint).
-	 */
-	private async _renderSummarizationPromptWithTracer(endpoint: IChatEndpoint, mode: SummaryMode, propsInfo: ISummarizedConversationHistoryInfo, stopwatch: StopWatch): Promise<{ messages: ChatMessage[]; tokenCount: number; removedCount: number }> {
-		try {
-			const renderer = PromptRenderer.create(
-				this.instantiationService,
-				endpoint,
-				ConversationHistorySummarizationPrompt,
-				{ ...propsInfo.props, enableCacheBreakpoints: false, simpleMode: mode === SummaryMode.Simple },
-			);
-			// Only attach the pruning-detection tracer when no other tracer is
-			// already in place — the dev `EnablePromptRendererTracing` config sets
-			// an `HTMLTracer` that the request logger downcasts to `HTMLTracer`,
-			// and replacing/chaining it would break that contract.
-			let removedCount = 0;
-			if (!renderer.tracer) {
-				renderer.tracer = {
-					didMaterializeTree: data => { removedCount = data.renderedTree.removed; },
-				};
-			}
-			const rendered = await renderer.render(undefined, this.token);
-			this.logInfo(`summarization prompt rendered in ${stopwatch.elapsed()}ms (${rendered.tokenCount} tokens, ${removedCount} pruned).`, mode);
-			return { messages: rendered.messages, tokenCount: rendered.tokenCount, removedCount };
-		} catch (e) {
-			const budgetExceeded = e instanceof BudgetExceededError;
-			const outcome = budgetExceeded ? 'budget_exceeded' : 'renderError';
-			this.logInfo(`Error rendering summarization prompt in mode: ${mode}. ${e.stack}`, mode);
-			this.sendSummarizationTelemetry(outcome, '', endpoint.model, mode, stopwatch.elapsed(), undefined, e instanceof Error ? e.message : String(e));
-			throw e;
-		}
-	}
-
-	/**
-	 * Shared message-processing + request + telemetry path used by both
-	 * off-flag and prism callers. Strips cache breakpoints / image content /
-	 * tool ids, applies provider-specific message fixups (Anthropic
-	 * tool-search, Gemini orphaned-tool-call), issues the chat request, and
-	 * returns the `SummarizationResult`.
-	 */
-	private async _executeSummarizationRequest(endpoint: IChatEndpoint, mode: SummaryMode, summarizationPrompt: ChatMessage[], buildToolOpts: () => CompactionToolOpts | undefined, associatedRequestId: string | undefined, stopwatch: StopWatch, treatLengthAsSuccess?: boolean): Promise<SummarizationResult> {
-		let summaryResponse: ChatResponse;
-		let promptTypes: string | undefined;
-		try {
-			const toolOpts = buildToolOpts();
 
 			stripCacheBreakpoints(summarizationPrompt);
 			replaceImageContentWithPlaceholders(summarizationPrompt);
@@ -1005,6 +926,114 @@ class ConversationHistorySummarizer {
 			}, this.token ?? CancellationToken.None);
 		} catch (e) {
 			this.logInfo(`Error from summarization request. ${e.message}`, mode);
+			this.sendSummarizationTelemetry('requestThrow', '', this.props.endpoint.model, mode, stopwatch.elapsed(), undefined, e instanceof Error ? e.message : String(e));
+			throw e;
+		}
+
+		const tokenizer = endpoint.acquireTokenizer();
+		const promptTokenDetails = await computePromptTokenDetails({
+			messages: summarizationPrompt,
+			tokenizer,
+			tools: this.props.tools ?? undefined,
+			totalPromptTokens: summaryResponse.type === ChatFetchResponseType.Success ? summaryResponse.usage?.prompt_tokens : undefined,
+		});
+
+		const durationMs = stopwatch.elapsed();
+		return {
+			result: await this.handleSummarizationResponse(summaryResponse, mode, durationMs, promptTypes),
+			promptTokenDetails,
+			model: endpoint.model,
+			summarizationMode: mode,
+			durationMs,
+		};
+	}
+
+	/**
+	 * Prism (on-flag) path. Resolves a separate compaction endpoint via the
+	 * standard CAPI endpoint provider and routes the summarisation request
+	 * through it. Renders with a pruning-detection tracer so the dispatcher
+	 * can fall back to the agent endpoint when the conversation can't fit
+	 * without losing content. Tool options are built via the shared
+	 * `buildCompactionToolOpts` helper so the schema is normalised against
+	 * the resolved endpoint's family (which may differ from the main agent
+	 * endpoint's family). Response handling is delegated to the prism-only
+	 * `_handlePrismSummarizationResponse` which treats Length-truncated
+	 * responses as Success and attributes telemetry to the compaction model.
+	 */
+	private async _getSummaryPrism(mode: SummaryMode, propsInfo: ISummarizedConversationHistoryInfo, compactionEndpoint: IChatEndpoint): Promise<SummarizationResult> {
+		const stopwatch = new StopWatch(false);
+
+		const tools = this.props.tools;
+		const toolTokens = mode === SummaryMode.Full && tools?.length
+			? await compactionEndpoint.acquireTokenizer().countToolTokens(tools)
+			: 0;
+		const endpoint = toolTokens > 0
+			? compactionEndpoint.cloneWithTokenOverride(
+				Math.max(1, Math.floor((compactionEndpoint.modelMaxPromptTokens - toolTokens) * 0.9)))
+			: compactionEndpoint;
+
+		const associatedRequestId = this.props.promptContext.conversation?.getLatestTurn().id;
+		const { messages: summarizationPrompt, tokenCount: renderedTokens, removedCount } = await this._renderSummarizationPromptWithTracer(endpoint, mode, propsInfo, stopwatch);
+
+		// Post-render check: prompt-tsx dropped nodes to fit the compaction
+		// endpoint's budget. The summary would be built from a truncated view of
+		// the conversation. Fall back to the agent endpoint (the pre-prism
+		// baseline) so the summary sees the full conversation instead.
+		if (removedCount > 0) {
+			throw new PruningOccurredError(removedCount, renderedTokens);
+		}
+
+		let summaryResponse: ChatResponse;
+		let promptTypes: string | undefined;
+		try {
+			const toolOpts = mode === SummaryMode.Full ? buildCompactionToolOpts(
+				this.props.tools,
+				endpoint.family,
+				(tool, rule) => {
+					this.logService.warn(`[ConversationHistorySummarizer] Tool ${tool} failed validation: ${rule}`);
+				},
+			) : undefined;
+
+			stripCacheBreakpoints(summarizationPrompt);
+			replaceImageContentWithPlaceholders(summarizationPrompt);
+
+			let messages = ToolCallingLoop.stripInternalToolCallIds(summarizationPrompt);
+
+			if (isAnthropicFamily(endpoint)) {
+				messages = stripToolSearchMessages(messages);
+			}
+
+			if (isGeminiFamily(endpoint)) {
+				const validationResult = ToolCallingLoop.validateToolMessagesCore(messages, { stripOrphanedToolCalls: true });
+				messages = validationResult.messages;
+				if (validationResult.strippedToolCallCount > 0) {
+					this.logInfo(`Stripped ${validationResult.strippedToolCallCount} orphaned tool calls from summarization prompt`, mode);
+					this.telemetryService.sendMSFTTelemetryEvent('summarization.strippedOrphanedToolCalls', {
+						model: endpoint.model,
+						mode,
+					}, {
+						strippedToolCallCount: validationResult.strippedToolCallCount,
+					});
+				}
+			}
+
+			promptTypes = messages.map(msg => `${msg.role}${'name' in msg && msg.name ? `-${msg.name}` : ''}:${getTextPart(msg.content).length}`).join(',');
+			summaryResponse = await endpoint.makeChatRequest2({
+				debugName: `summarizeConversationHistory-${mode}`,
+				messages,
+				finishedCb: undefined,
+				location: ChatLocation.Agent,
+				requestOptions: {
+					temperature: 0,
+					stream: false,
+					...toolOpts
+				},
+				telemetryProperties: associatedRequestId ? { associatedRequestId } : undefined,
+				enableRetryOnFilter: true,
+				interactionTypeOverride: 'conversation-compaction',
+			}, this.token ?? CancellationToken.None);
+		} catch (e) {
+			this.logInfo(`Error from summarization request. ${e.message}`, mode);
 			this.sendSummarizationTelemetry('requestThrow', '', endpoint.model, mode, stopwatch.elapsed(), undefined, e instanceof Error ? e.message : String(e));
 			throw e;
 		}
@@ -1019,7 +1048,7 @@ class ConversationHistorySummarizer {
 
 		const durationMs = stopwatch.elapsed();
 		return {
-			result: await this.handleSummarizationResponse(summaryResponse, mode, durationMs, endpoint.model, promptTypes, treatLengthAsSuccess),
+			result: await this._handlePrismSummarizationResponse(summaryResponse, mode, durationMs, endpoint.model, promptTypes),
 			promptTokenDetails,
 			model: endpoint.model,
 			summarizationMode: mode,
@@ -1027,11 +1056,82 @@ class ConversationHistorySummarizer {
 		};
 	}
 
-	private async handleSummarizationResponse(response: ChatResponse, mode: SummaryMode, elapsedTime: number, model: string, promptTypes?: string, treatLengthAsSuccess?: boolean): Promise<FetchSuccess<string>> {
-		if (treatLengthAsSuccess && response.type === ChatFetchResponseType.Length) {
-			// Prism-only: model hit its output token cap. The partial text is still usable as
-			// a summary, so surface a warning and synthesise a FetchSuccess instead of failing.
-			// Off-flag callers don't pass treatLengthAsSuccess and continue to throw as before.
+	/**
+	 * Prism-only render variant that additionally captures a precise pruning
+	 * signal via a prompt-tsx tracer. Used by `_getSummaryPrism` to detect when
+	 * the compaction endpoint's smaller prompt budget caused nodes to be dropped
+	 * (in which case the caller falls back to the agent endpoint).
+	 */
+	private async _renderSummarizationPromptWithTracer(endpoint: IChatEndpoint, mode: SummaryMode, propsInfo: ISummarizedConversationHistoryInfo, stopwatch: StopWatch): Promise<{ messages: ChatMessage[]; tokenCount: number; removedCount: number }> {
+		try {
+			const renderer = PromptRenderer.create(
+				this.instantiationService,
+				endpoint,
+				ConversationHistorySummarizationPrompt,
+				{ ...propsInfo.props, enableCacheBreakpoints: false, simpleMode: mode === SummaryMode.Simple },
+			);
+			// Only attach the pruning-detection tracer when no other tracer is
+			// already in place — the dev `EnablePromptRendererTracing` config sets
+			// an `HTMLTracer` that the request logger downcasts to `HTMLTracer`,
+			// and replacing/chaining it would break that contract.
+			let removedCount = 0;
+			if (!renderer.tracer) {
+				renderer.tracer = {
+					didMaterializeTree: data => { removedCount = data.renderedTree.removed; },
+				};
+			}
+			const rendered = await renderer.render(undefined, this.token);
+			this.logInfo(`summarization prompt rendered in ${stopwatch.elapsed()}ms (${rendered.tokenCount} tokens, ${removedCount} pruned).`, mode);
+			return { messages: rendered.messages, tokenCount: rendered.tokenCount, removedCount };
+		} catch (e) {
+			const budgetExceeded = e instanceof BudgetExceededError;
+			const outcome = budgetExceeded ? 'budget_exceeded' : 'renderError';
+			this.logInfo(`Error rendering summarization prompt in mode: ${mode}. ${e.stack}`, mode);
+			this.sendSummarizationTelemetry(outcome, '', endpoint.model, mode, stopwatch.elapsed(), undefined, e instanceof Error ? e.message : String(e));
+			throw e;
+		}
+	}
+
+	private async handleSummarizationResponse(response: ChatResponse, mode: SummaryMode, elapsedTime: number, promptTypes?: string): Promise<FetchSuccess<string>> {
+		if (response.type !== ChatFetchResponseType.Success) {
+			const outcome = response.type;
+			this.sendSummarizationTelemetry(outcome, response.requestId, this.props.endpoint.model, mode, elapsedTime, undefined, response.reason ?? response.type);
+			this.logInfo(`Summarization request failed. ${response.type} ${response.reason ?? response.type}`, mode);
+			if (response.type === ChatFetchResponseType.Canceled) {
+				throw new CancellationError();
+			}
+
+			throw new Error('Summarization request failed');
+		}
+
+		const summarySize = await this.sizing.countTokens(response.value);
+		const effectiveBudget =
+			!!this.props.maxSummaryTokens
+				? Math.min(this.sizing.tokenBudget, this.props.maxSummaryTokens)
+				: this.sizing.tokenBudget;
+		if (summarySize > effectiveBudget) {
+			this.sendSummarizationTelemetry('too_large', response.requestId, this.props.endpoint.model, mode, elapsedTime, response.usage, `${summarySize} tokens exceeds budget ${effectiveBudget}`);
+			this.logInfo(`Summary too large: ${summarySize} tokens (effective budget ${effectiveBudget})`, mode);
+			throw new Error('Summary too large');
+		}
+
+		this.sendSummarizationTelemetry('success', response.requestId, this.props.endpoint.model, mode, elapsedTime, response.usage, undefined, promptTypes);
+		this.logInfo(`Summarization usage: prompt=${response.usage?.prompt_tokens ?? '?'}, cached=${response.usage?.prompt_tokens_details?.cached_tokens ?? '?'}, completion=${response.usage?.completion_tokens ?? '?'}`, mode);
+		return response;
+	}
+
+	/**
+	 * Prism-only response handler. Treats `Length`-truncated responses as
+	 * Success (the partial text is still usable as a summary) and attributes
+	 * all telemetry to the supplied `model` (the compaction endpoint's model)
+	 * rather than to `this.props.endpoint.model` so prism failures aren't
+	 * charged to the main agent endpoint.
+	 */
+	private async _handlePrismSummarizationResponse(response: ChatResponse, mode: SummaryMode, elapsedTime: number, model: string, promptTypes?: string): Promise<FetchSuccess<string>> {
+		if (response.type === ChatFetchResponseType.Length) {
+			// Model hit its output token cap. The partial text is still usable
+			// as a summary, so surface a warning and synthesise a FetchSuccess
+			// instead of failing.
 			this.logService.warn(`[ConversationHistorySummarizer] [${mode}] prism summarization response truncated by model length limit (${response.truncatedValue.length} chars). Using partial summary.`);
 			response = {
 				type: ChatFetchResponseType.Success,
@@ -1159,7 +1259,7 @@ export function replaceImageContentWithPlaceholders(messages: ChatMessage[]): vo
 	messages.forEach(message => {
 		message.content = message.content.map(part => {
 			if (part.type === Raw.ChatCompletionContentPartKind.Image) {
-				return { type: Raw.ChatCompletionContentPartKind.Text, text: '[User shared an image]' };
+				return { type: Raw.ChatCompletionContentPartKind.Text, text: '[Image was attached]' };
 			}
 			return part;
 		});
