@@ -589,7 +589,6 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 			location: this.location,
 			enableSummarization: summarizationEnabled,
 			enableCacheBreakpoints: summarizationEnabled && !isMessagesApi,
-			currentContextTokens: this._lastRenderTokenCount > 0 ? this._lastRenderTokenCount : undefined,
 			...this.extraPromptProps,
 			customizations: this._resolvedCustomizations
 		};
@@ -853,7 +852,6 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 			// across both compaction paths.
 			const routingDecision = await decidePrismRouting(
 				this.endpoint,
-				effectivePostRender,
 				this.configurationService,
 				this.expService,
 				this._endpointProvider,

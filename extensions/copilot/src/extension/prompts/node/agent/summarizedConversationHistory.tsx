@@ -416,13 +416,6 @@ export interface SummarizedAgentHistoryProps extends BasePromptElementProps, Age
 	 * drifted from its frozen snapshot. See {@link AgentUserMessageProps.customizationsIndexUpdate}.
 	 */
 	readonly customizationsIndexUpdate?: { value: string; toolReferences: readonly ChatLanguageModelToolReference[] | undefined };
-	/**
-	 * Size (in tokens) of the most recent successful agent render. Used by the
-	 * prism compaction dispatcher to skip the prism path when the conversation
-	 * is already known to exceed the compaction endpoint's prompt budget.
-	 * Optional — callers that don't have a recent render size omit it.
-	 */
-	readonly currentContextTokens?: number;
 }
 
 /**
@@ -478,13 +471,12 @@ interface IPrismRoutingDecision {
  * Decision order:
  *   1. Prism flag disabled → main agent.
  *   2. Agent model not in prism filter → main agent.
- *   3. Known current context size exceeds compaction endpoint's prompt budget
- *      → main agent (avoids pruning; matches the pre-prism baseline).
- *   4. Otherwise → prism.
+ *   3. Otherwise → prism (the `_getSummaryPrism` post-render pruning check
+ *      falls back to the agent endpoint when the conversation can't fit
+ *      without losing content).
  */
 export async function decidePrismRouting(
 	agentEndpoint: IChatEndpoint,
-	currentContextTokens: number | undefined,
 	configurationService: IConfigurationService,
 	experimentationService: IExperimentationService,
 	endpointProvider: IEndpointProvider,
@@ -502,16 +494,9 @@ export async function decidePrismRouting(
 		};
 	}
 	const compactionEndpoint = await resolveCompactionEndpoint(agentEndpoint, configurationService, experimentationService, endpointProvider, logService);
-	if (currentContextTokens !== undefined && currentContextTokens > compactionEndpoint.modelMaxPromptTokens) {
-		return {
-			usePrism: false,
-			reason: `current context (${currentContextTokens} tokens) exceeds compaction endpoint budget (${compactionEndpoint.model}, modelMaxPromptTokens=${compactionEndpoint.modelMaxPromptTokens})`,
-			compactionEndpoint,
-		};
-	}
 	return {
 		usePrism: true,
-		reason: `prism enabled, agent model in filter, conversation fits compaction budget (currentContextTokens=${currentContextTokens ?? '?'}, compactionEndpoint=${compactionEndpoint.model}, compactionBudget=${compactionEndpoint.modelMaxPromptTokens})`,
+		reason: `prism enabled, agent model in filter (compactionEndpoint=${compactionEndpoint.model}, compactionBudget=${compactionEndpoint.modelMaxPromptTokens})`,
 		compactionEndpoint,
 	};
 }
@@ -764,7 +749,6 @@ class ConversationHistorySummarizer {
 		// agentIntent.ts — see decidePrismRouting for the routing rules.
 		const decision = await decidePrismRouting(
 			this.props.endpoint,
-			this.props.currentContextTokens,
 			this.configurationService,
 			this.experimentationService,
 			this.endpointProvider,
